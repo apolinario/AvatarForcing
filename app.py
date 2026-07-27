@@ -1,5 +1,14 @@
 #!/usr/bin/env python
-"""Real-time conversational avatar — HF Space main app (port 7860)."""
+"""Real-time conversational avatar — HF Space main app (port 7860), ZeroGPU.
+
+``import spaces`` is the FIRST import on purpose: it monkey-patches
+``torch.cuda.*`` and installs the function mode that intercepts ``.to("cuda")``,
+and it can only do that before torch initialises CUDA. Everything downstream
+(``server.engine`` -> ``models.avatarforcing`` -> torch) depends on it having
+run first.
+"""
+import spaces  # noqa: F401  # MUST precede torch / any CUDA-touching import
+
 import logging, os, socket, sys, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -97,6 +106,28 @@ from server.conversation import DEFAULT_SYSTEM_PROMPT, ConversationBrain
 from server.engine import AvatarEngine, FaceCropper
 from server.web import build_app
 
+# --------------------------------------------------------------------------- #
+# module-scope weight load (ZeroGPU packing)
+#
+# This builds the graph and moves every parameter to "cuda" in the MAIN process,
+# where ZeroGPU intercepts the move: the real storage stays on CPU behind a fake
+# CUDA alias and is packed so the first @spaces.GPU entry restores it straight
+# into VRAM. Doing it here rather than in the fork is what keeps the ~37 s model
+# load off the visitor's 90 s lease.
+#
+# load_weights() runs no forward pass -- that is the rule that makes it legal
+# here. The reference latents and the cuDNN/cuBLAS warm-up need a real GPU and
+# live in AvatarEngine.warm(), which server/gpu_session.py calls inside the
+# lease. A forward pass at this point would silently execute on CPU.
+# --------------------------------------------------------------------------- #
+_ENGINE = AvatarEngine(REF, repo_dir=REPO, device=DEVICE, seed=25,
+                       avatar_norm_std=NORM, user_norm_std=None)
+if FETCH:
+    t0 = time.perf_counter()
+    log.info("building AvatarForcing + packing weights for ZeroGPU")
+    _ENGINE.load_weights()
+    log.info("weights ready in %.1f s", time.perf_counter() - t0)
+
 
 def brain_factory(on_event, cfg):
     """One brain per WS session, carrying that session's UI overrides.
@@ -113,9 +144,9 @@ def brain_factory(on_event, cfg):
 
 
 app = build_app(
-    engine_factory=lambda: AvatarEngine(REF, repo_dir=REPO, device=DEVICE,
-                                        seed=25, avatar_norm_std=NORM,
-                                        user_norm_std=None),
+    # The already-packed engine, not a fresh one: the fork inherits this object
+    # with its weights, and only warm() still has to run inside the lease.
+    engine_factory=lambda: _ENGINE,
     brain_factory=brain_factory,
     face_cropper_factory=lambda: FaceCropper(device=DEVICE),
     default_system_prompt=DEFAULT_SYSTEM_PROMPT,
@@ -132,11 +163,8 @@ if __name__ == "__main__":
     finally:
         s.close()
 
-    t0 = time.perf_counter()
-    log.info("preloading AvatarForcing (~52 s: 37 s model + 14 s cuDNN autotune)")
-    app.preload_blocking()                      # BEFORE launch(); gradio's lifespan drops on_event("startup")
-    log.info("engine ready in %.1f s", time.perf_counter() - t0)
-
+    # No preload step: the weights were built and packed at import above, and
+    # the warm-up needs a GPU, which only exists inside a /run_session lease.
     app.launch(
         server_name=HOST,        # "0.0.0.0" — required inside the Space
         server_port=PORT,        # 7860

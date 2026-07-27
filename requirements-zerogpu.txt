@@ -1,0 +1,52 @@
+# HF Space cold start: python 3.12, ZeroGPU (NVIDIA RTX PRO 6000 Blackwell, sm_120).
+# Covers app.py, server/*.py and the vendored AvatarForcing (models/, inference.py).
+# AvatarForcing/{requirements.txt,environment.sh} are from 2023 and mostly do not
+# install on py3.12 (numpy==1.26.0, transformers==4.30.2, torch 2.0.1+cu118) —
+# reconciled below against what the code actually imports.
+
+# --- torch stack ----------------------------------------------------------- #
+# The ZeroGPU image already ships cu128 wheels for every torch it accepts
+# (2.8.0 / 2.9.1 / 2.10.0 / 2.11.0), so the explicit PyTorch index and the
+# +cu128 local tags the dedicated Space needed are dropped -- keeping them makes
+# pip resolve against download.pytorch.org and fight the preinstalled runtime.
+torch==2.11.0
+torchvision==0.26.0         # must match torch 2.11; models/avatarforcing uses torchvision.transforms.functional
+# torchaudio is NOT needed: nothing imports it (audio I/O is soundfile + soxr).
+
+# --- AvatarForcing model code (server/engine.py imports models.* directly) -- #
+transformers>=5.0,<6        # Wav2Vec2Model/Config/FeatureExtractor + modeling_outputs only;
+                            # models/wav2vec2.py is already patched for the v5 output_attentions check
+timm>=1.0.9,<2              # timm.layers.use_fused_attn + models.vision_transformer.Mlp
+omegaconf>=2.3.0
+opencv-python>=4.10         # resize/cvtColor/imread/INTER_AREA only — API stable across 4.x and 5.x
+face-alignment>=1.4.1       # only detection.sfd.FaceDetector is used (server/engine.py)
+numpy>=2.4,<2.5             # <2.5 is forced by numba, a hard dep of face-alignment
+pillow>=10.0
+pyyaml>=6.0
+tqdm>=4.66
+
+# --- AvatarForcing/inference.py CLI only (not on the server hot path) ------- #
+soundfile>=0.12             # librosa replacement, see the NOTE at the top of inference.py
+soxr>=0.5
+av>=12.0                    # torchvision.io.write_video is gone in torchvision >= 0.26
+albumentations>=2.0.8
+pandas>=2.2
+# librosa deliberately omitted: librosa.core.audio needs numba, no numba release
+# supports the numpy this env resolves to; inference.py uses soundfile+soxr instead.
+# matplotlib deliberately omitted: it is in AvatarForcing/requirements.txt but nothing imports it.
+
+# --- server ---------------------------------------------------------------- #
+# gradio is NOT listed: it is platform-managed and pinned by README sdk_version
+# (6.20.0, which is what gives server/web.py `from gradio import Server`).
+# Listing it here breaks the ZeroGPU runtime's own gradio integration.
+fastapi>=0.115              # server/web.py imports it directly (also a gradio dep)
+uvicorn>=0.30
+websockets>=13.0            # server/conversation.py uses websockets.asyncio.client
+python-dotenv>=1.0          # optional .env load in server/conversation.py
+openai>=1.40                # AsyncOpenAI against the HF router (chat.completions)
+elevenlabs>=2.20            # elevenlabs.realtime {AudioFormat, CommitStrategy, RealtimeEvents}
+
+# --- cold-start weight download (app.py: ensure_weights) ------------------- #
+# checkpoints come from the Hub mirror multimodalart/AvatarForcingHelpers (the
+# authors' Google Drive links rate-limit); gdown is no longer needed.
+# huggingface_hub is NOT listed either -- preinstalled and platform-managed.

@@ -143,7 +143,13 @@ class BrainConfig:
             load_dotenv(self.env_path, override=False)
         return replace(
             self,
-            eleven_api_key=self.eleven_api_key or os.environ.get("ELEVEN_TOKEN") or "",
+            # Both spellings: the dedicated Space's secret is ELEVEN_TOKEN, the
+            # ZeroGPU one's is ELEVENLABS_API_KEY. Accepting either keeps one
+            # code path working against both Spaces' secret sets.
+            eleven_api_key=(self.eleven_api_key
+                            or os.environ.get("ELEVEN_TOKEN")
+                            or os.environ.get("ELEVENLABS_API_KEY")
+                            or ""),
             hf_token=self.hf_token or os.environ.get("HF_TOKEN") or "",
             voice_id=self.voice_id or os.environ.get("VOICE_ID") or "",
         )
@@ -1192,6 +1198,37 @@ class ConversationBrain:
                 await tts.close()
             if empty and self._state in ("thinking", "speaking"):
                 self._set_state("listening")
+
+    # ---------------------------------------------------------------- #
+    # history hand-off across sessions
+    #
+    # On ZeroGPU a conversation outlives its GPU lease: the worker is reclaimed
+    # every SESSION_SECONDS and the next one is a fresh fork with a fresh brain.
+    # Moving the plain [{role, content}] list across is what lets the avatar
+    # keep talking about what it was just talking about. Only the LLM history
+    # travels -- audio buffers, VAD state and the ElevenLabs socket are all
+    # rebuilt, and the video rollout necessarily restarts.
+    # ---------------------------------------------------------------- #
+    def export_history(self) -> t.List[dict]:
+        """A copy of the LLM turn history, safe to hand to a later brain."""
+        return [dict(m) for m in self._history]
+
+    def import_history(self, history) -> int:
+        """Seed this brain's history. Returns how many messages were adopted.
+
+        Defensive because the value round-trips through module state that
+        outlives the session that produced it.
+        """
+        clean = []
+        for m in history or []:
+            if not isinstance(m, dict):
+                continue
+            role, content = m.get("role"), m.get("content")
+            if role in ("user", "assistant") and isinstance(content, str) and content:
+                clean.append({"role": role, "content": content})
+        cap = self.cfg.history_max_messages * 2
+        self._history = clean[-cap:]
+        return len(self._history)
 
     def _commit_history(self, user_text: str, avatar_text: str) -> None:
         self._history.append({"role": "user", "content": user_text})

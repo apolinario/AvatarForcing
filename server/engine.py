@@ -430,6 +430,7 @@ class AvatarEngine:
         self.n_pose_corr = 0
 
         self._loaded = False
+        self._weights_loaded = False
         #: False once set_reference() has swapped in a user-supplied identity.
         #: The web layer reads it to avoid re-running the (GPU-bound) default
         #: recompute for sessions that never uploaded anything.
@@ -455,7 +456,25 @@ class AvatarEngine:
     # loading
     # ------------------------------------------------------------------ #
     def load(self) -> None:
-        if self._loaded:
+        """Weights + warm-up, the dedicated-GPU path.
+
+        ZeroGPU splits these two halves across the process boundary — see
+        :meth:`load_weights` and :meth:`warm`.
+        """
+        self.load_weights()
+        self.warm()
+
+    def load_weights(self) -> None:
+        """Build the graph and get every parameter onto ``self.device``.
+
+        Runs in the **parent** process on ZeroGPU (``app.py`` calls it at import).
+        Nothing here executes a forward pass, which is what makes that legal:
+        ZeroGPU's function mode intercepts ``.to("cuda")`` / ``copy_`` and keeps
+        the real storage on CPU behind a fake-CUDA alias, then packs it so the
+        first ``@spaces.GPU`` entry restores it straight into VRAM. A forward
+        pass here would silently run on CPU and take minutes, hence :meth:`warm`.
+        """
+        if self._weights_loaded:
             return
         import torch
         from omegaconf import OmegaConf
@@ -494,7 +513,11 @@ class AvatarEngine:
                 os.path.join(self.repo_dir, "pretrained_dir", "motion_autoencoder.pth"),
                 os.path.join(self.repo_dir, "pretrained_dir", "flow_transformer.pth"),
             ):
-                sd = torch.load(ckpt, map_location=self.device, weights_only=True)
+                # map_location="cpu" (not self.device): under ZeroGPU's parent
+                # patching a "cuda" map_location would route the whole 800 MB
+                # through the storage interception path for no gain — the
+                # copy_ below already lands each tensor on the device.
+                sd = torch.load(ckpt, map_location="cpu", weights_only=True)
                 for name, param in G.named_parameters():
                     if name in sd:
                         param.copy_(sd[name].to(self.device))
@@ -509,6 +532,20 @@ class AvatarEngine:
 
         # --- trap (a): rotary table is precomputed for max_seq_len=1024 only --- #
         self._install_big_rope_table()
+
+        self._weights_loaded = True
+
+    def warm(self) -> None:
+        """Reference latents + cuDNN/cuBLAS warm-up. Needs a **real** GPU.
+
+        On ZeroGPU this runs inside the held ``@spaces.GPU`` lease (see
+        ``server/gpu_session.py``), right after the packed weights are restored
+        to VRAM and before ``__READY__`` is announced.
+        """
+        if self._loaded:
+            return
+        self.load_weights()
+        import torch
 
         # --- reference-image latents (once per engine) --- #
         self._precompute_reference()

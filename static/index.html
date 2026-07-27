@@ -54,6 +54,9 @@
     transition:background .2s ease,color .2s ease;
   }
   .pill .dot{width:.6em;height:.6em;border-radius:50%;background:currentColor;flex:none}
+  .lease{margin-left:.5rem;font:500 .78rem/1 ui-monospace,SFMono-Regular,Menlo,monospace;
+    letter-spacing:.02em;color:var(--ink-2);white-space:nowrap}
+  .lease[data-low="1"]{color:var(--alert)}
   .pill[data-s="offline"]{color:var(--ink-2)}
   .pill[data-s="connecting"],.pill[data-s="thinking"]{background:var(--hi)}
   .pill[data-s="speaking"]{background:var(--ink);color:var(--paper)}
@@ -132,7 +135,11 @@
   .panel-head .meta{margin-left:auto;font-family:var(--mono);font-size:.8em;color:var(--ink-2)}
   /* Tabbed head: the tabs replace the <h3> in the same strip, so a tabbed panel
      is exactly as tall as a plain one. */
-  .panel-head.tabs{padding:0;align-items:stretch}
+  /* gap:0 matters: .panel-head sets gap:.6em, which leaves a paper-coloured
+     gutter either side of the selected tab so its highlight reads as a floating
+     block instead of filling the cell. The tabs butt against each other and are
+     separated by their own border-right instead. */
+  .panel-head.tabs{padding:0;gap:0;align-items:stretch}
   .tab{
     font-family:var(--mono);font-size:.85em;font-weight:700;text-transform:uppercase;
     letter-spacing:.1em;color:var(--ink-2);background:var(--paper);
@@ -178,6 +185,8 @@
   .overlay-center h2{margin:0;font-size:1.5em;font-weight:300;line-height:1.15}
   .overlay-center p{margin:0;max-width:34ch;font-size:.9em;line-height:1.5;color:var(--ink-2)}
   .overlay-center.hidden{display:none}
+  .ov-actions{display:flex;gap:.4em;flex-wrap:wrap;justify-content:center;margin-top:.4em}
+  .ov-actions[hidden]{display:none}
   .spinner{
     width:1.4em;height:1.4em;border-radius:50%;
     border:3px solid var(--rule);border-top-color:var(--ink);
@@ -276,6 +285,10 @@
   <div class="pill" id="pill" data-s="offline" role="status" aria-live="polite">
     <span class="dot"></span><span id="pillText">Offline</span>
   </div>
+  <!-- ZeroGPU leases the GPU for a fixed number of seconds per session, so the
+       countdown is real information, not decoration: it is how long the avatar
+       has left before the worker is reclaimed. -->
+  <div class="lease" id="lease" hidden><span id="leaseText"></span></div>
 </header>
 
 <div class="setup">
@@ -312,6 +325,12 @@
           <h2 id="ovTitle">Ready when you are</h2>
           <p id="ovText">Press <strong>Start session</strong> and allow camera + microphone.
             Your webcam drives the avatar's head motion — just talk normally.</p>
+          <!-- Only shown when a GPU lease expires: the conversation can carry
+               over to the next lease, but the choice has to be explicit. -->
+          <div class="ov-actions" id="ovActions" hidden>
+            <button class="button primary" id="ovContinue" type="button">Keep going</button>
+            <button class="button" id="ovRestart" type="button">New session</button>
+          </div>
         </div>
       </div>
     </div>
@@ -348,7 +367,7 @@
         <button class="tab" id="tabTranscript" role="tab" aria-selected="true"
                 aria-controls="transcript" type="button">Transcript</button>
         <button class="tab" id="tabPrompt" role="tab" aria-selected="false"
-                aria-controls="promptPane" type="button">Prompt</button>
+                aria-controls="promptPane" type="button">Sys prompt</button>
         <span class="meta" id="turnCount">0 turns</span>
         <button class="headbtn" id="clearBtn" type="button" disabled
                 aria-label="Clear the transcript display"
@@ -425,7 +444,8 @@ const REF_MAX = 1024, REF_Q = 0.9;
 
 const $ = (id) => document.getElementById(id);
 const els = {};
-["pill","pillText","stage","avatar","overlay","ovTitle","ovText","ovIcon","pip","pipTag",
+["pill","pillText","lease","leaseText","ovActions","ovContinue","ovRestart",
+ "stage","avatar","overlay","ovTitle","ovText","ovIcon","pip","pipTag",
  "webcam","stagebar","micBar","clockLbl","startBtn","startLbl","muteBtn","transcript",
  "emptyState","turnCount","dBlocks","dFps","dBuf","dUnder","dUp","dDown","dMic","dRtt",
  "verLbl","refInput","refBtn","refThumb","refClear","refName","voiceInput",
@@ -445,7 +465,11 @@ const S = {
   curAvatarBubble:null, curPartial:null, turns:0, sessionStarted:0,
   refBytes:null, refURL:null,   // re-encoded reference upload (null = server default)
   defaultPrompt:"", promptDirty:false, sentPrompt:null,
+  leaseJob:null, leaseOver:false,   // the /run_session job holding the ZeroGPU worker
+  resume:false,                     // carry the conversation into the next lease
 };
+// Filled in from the lease's `ready` message; only used for wording.
+let LEASE_HINT = "a while";
 
 /* ---------------------------------------------------------------- status --- */
 const LABEL = { offline:"Offline", connecting:"Connecting…", ready:"Ready",
@@ -457,11 +481,14 @@ function setStatus(s, note){
   els.pillText.textContent = note || LABEL[s] || s;
   els.stage.classList.toggle("speaking", s === "speaking");
 }
-function showOverlay(title, html, spinner){
+function showOverlay(title, html, spinner, actions){
   els.overlay.classList.remove("hidden");
   els.ovTitle.textContent = title;
   els.ovText.innerHTML = html;
   els.ovIcon.className = spinner ? "spinner" : "sr";
+  // Default hidden: every other overlay is informational, and a stale pair of
+  // buttons under "Camera blocked" would offer a choice that does nothing.
+  els.ovActions.hidden = !actions;
 }
 function hideOverlay(){
   if (!els.overlay.classList.contains("hidden")) els.overlay.classList.add("hidden");
@@ -829,6 +856,69 @@ function sendBin(tag, payload){
 }
 function sendJSON(obj){ if (S.ws && S.ws.readyState === 1) S.ws.send(JSON.stringify(obj)); }
 
+/* ------------------------------------------------------------------ lease --- */
+/* On ZeroGPU there is no GPU until someone asks for one, and the ask has to go
+   through the Gradio client rather than a plain fetch of the route: the client
+   runs the `zerogpu-headers` postMessage handshake against the huggingface.co
+   parent frame and attaches the resulting X-IP-Token, which is what bills the
+   GPU seconds to the signed-in viewer instead of the Space's shared IP pool.
+
+   /run_session streams JSON status lines and holds the GPU for as long as it is
+   still yielding, so this promise resolves on `ready` while the same iterator
+   keeps running underneath to drive the countdown and notice expiry. */
+function setLease(text, low){
+  if (text == null){ els.lease.hidden = true; return; }
+  els.lease.hidden = false;
+  els.lease.dataset.low = low ? "1" : "0";
+  els.leaseText.textContent = text;
+}
+
+function onLeaseExpired(){
+  if (!S.running) return;
+  S.leaseOver = true;
+  stopSession();
+  // The avatar's video rollout always restarts on a new lease (fresh worker,
+  // fresh KV cache) — it is the *conversation* that can carry over, so the
+  // wording promises only that.
+  showOverlay("GPU session ended",
+    "ZeroGPU reclaimed the worker after " + LEASE_HINT + ".<br>" +
+    "Keep going to carry this conversation into a new one.", false, true);
+}
+
+async function acquireLease(){
+  const { Client } = await import("https://cdn.jsdelivr.net/npm/@gradio/client/dist/index.min.js");
+  const client = await Client.connect(window.location.origin);
+  const job = client.submit("/run_session", {});
+  S.leaseJob = job;
+  return await new Promise((resolve, reject) => {
+    let settled = false;
+    const done = (fn, arg) => { if (!settled){ settled = true; fn(arg); } };
+    (async () => {
+      try {
+        for await (const msg of job){
+          if (msg.type !== "data") continue;
+          let ev;
+          try { ev = JSON.parse(msg.data[0]); } catch (e){ continue; }
+          if (ev.event === "ready"){
+            done(resolve, ev);
+          } else if (ev.event === "tick"){
+            const r = Math.max(0, Math.round(ev.remaining));
+            setLease(r + "s GPU left", r <= 15);
+          } else if (ev.event === "busy" || ev.event === "error"){
+            done(reject, new Error(ev.text || ev.event));
+          }
+        }
+      } catch (e){
+        done(reject, e);
+      }
+      // The iterator ending means the lease is gone, however it ended.
+      done(reject, new Error("The GPU session ended before it was ready."));
+      setLease(null);
+      onLeaseExpired();
+    })();
+  });
+}
+
 function connect(){
   clearTimeout(S.retryTimer);
   setStatus("connecting", S.retries ? "Reconnecting…" : "Connecting…");
@@ -844,6 +934,7 @@ function connect(){
     sendJSON({ type:"session_config",
                voice_id: els.voiceInput.value.trim(),
                system_prompt: promptOverride(),
+               resume: !!S.resume,
                reference: !!S.refBytes });
     S.sentPrompt = promptValue();
     updatePromptNote();
@@ -869,6 +960,9 @@ function connect(){
   ws.onerror = () => {};
   ws.onclose = (ev) => {
     if (S.closedByUser || !S.running){ setStatus("offline"); return; }
+    // Reconnecting is pointless once the GPU is gone -- the socket would just be
+    // refused with `no_lease`. onLeaseExpired() owns the teardown in that case.
+    if (S.leaseOver) return;
     if (ev.code === 1013){
       setStatus("busy", "Session in use");
       showOverlay("Someone else is live",
@@ -904,6 +998,16 @@ function onJSON(text){
     case "reference":
       systemLine(m.ok ? "Using your reference photo" : ("⚠ " + (m.text || "reference rejected")));
       break;
+    case "resumed":
+      systemLine(m.messages
+        ? "Continuing — the avatar still remembers " + m.messages + " messages"
+        : "Starting fresh — the earlier conversation had expired");
+      break;
+    case "lease_ended":
+      // The server noticed the GPU went away before our own iterator did.
+      systemLine("GPU session ended");
+      onLeaseExpired();
+      break;
     case "error":
       if (m.code === "busy") setStatus("busy", "Session in use");
       else {
@@ -919,8 +1023,12 @@ function onJSON(text){
 }
 
 /* ----------------------------------------------------------- session ctl --- */
-async function startSession(){
+async function startSession(opts){
   if (S.running) return;
+  // resume=true asks the server to seed the new brain with the previous
+  // session's turns. Anything else starts clean, transcript included.
+  S.resume = !!(opts && opts.resume);
+  if (!S.resume) clearTranscript();
   S.closedByUser = false;
   els.startBtn.disabled = true;
   showOverlay("Requesting camera & microphone", "Your browser will ask for permission.", true);
@@ -952,7 +1060,33 @@ async function startSession(){
     showOverlay("Could not start audio capture", String((e && e.message) || e), false);
     return;
   }
+  // Reserve the GPU *after* camera and mic are up: the lease clock starts the
+  // moment ZeroGPU hands us a worker, so none of it should be spent waiting on
+  // a permission dialog. The first lease of a cold Space also pays the engine
+  // warm-up, which is why this can sit here for a while.
+  showOverlay("Reserving a GPU",
+    "ZeroGPU is assigning a worker and warming the model. This takes a few seconds — " +
+    "longer if others are queued ahead of you.", true);
+  setStatus("connecting", "Queued for GPU");
+  try {
+    const lease = await acquireLease();
+    LEASE_HINT = Math.round(lease.session_seconds || 0) + "s";
+    setLease(Math.round(lease.session_seconds || 0) + "s GPU left", false);
+  } catch (e){
+    S.media.getTracks().forEach((t) => t.stop()); S.media = null;
+    if (S.micNode){ try { S.micNode.disconnect(); } catch (e2){} S.micNode = null; }
+    if (S.micCtx){ S.micCtx.close().catch(()=>{}); S.micCtx = null; }
+    els.pip.classList.remove("on");
+    els.startBtn.disabled = false;
+    setStatus("error", "No GPU");
+    showOverlay("Could not get a GPU",
+      String((e && e.message) || e) +
+      "<br><small>ZeroGPU quota is per viewer and refills daily.</small>", false);
+    return;
+  }
+
   S.running = true;
+  S.leaseOver = false;
   els.startBtn.disabled = false;
   els.startBtn.classList.remove("primary");
   els.startBtn.classList.add("stop");
@@ -965,6 +1099,10 @@ async function startSession(){
 
 function stopSession(){
   S.running = false; S.closedByUser = true;
+  // Cancelling the /run_session job releases the GPU immediately instead of
+  // letting the rest of the lease burn the viewer's quota on an empty session.
+  if (S.leaseJob){ try { S.leaseJob.cancel(); } catch (e){} S.leaseJob = null; }
+  setLease(null);
   clearTimeout(S.retryTimer);
   clearInterval(S.camTimer); S.camTimer = null;
   if (S.ws){ try { S.ws.close(1000, "bye"); } catch (e){} S.ws = null; }
@@ -1001,6 +1139,8 @@ function toggleMute(){
 }
 
 els.startBtn.addEventListener("click", () => (S.running ? stopSession() : startSession()));
+els.ovContinue.addEventListener("click", () => startSession({ resume:true }));
+els.ovRestart.addEventListener("click", () => startSession({ resume:false }));
 els.muteBtn.addEventListener("click", toggleMute);
 document.addEventListener("keydown", (e) => {
   if (e.target && /^(INPUT|TEXTAREA)$/.test(e.target.tagName)) return;

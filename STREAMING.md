@@ -108,8 +108,10 @@ The default reference portrait is this repo's `data/rumi.jpg`; point
 
 A variant of this runs on Hugging Face ZeroGPU, where the GPU only exists inside
 a `@spaces.GPU` call and every call forks a fresh worker — which a stateful KV
-cache cannot survive. See the `streaming-zerogpu` branch: it holds one GPU lease
-per conversation and drives the engine over fork queues from the web process.
+cache cannot survive. See the `streaming-zerogpu` branch and its
+[ZEROGPU.md](https://github.com/apolinario/AvatarForcing/blob/streaming-zerogpu/ZEROGPU.md):
+it holds one GPU lease per conversation and drives the engine over fork queues
+from the web process.
 
 ## License
 
