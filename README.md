@@ -21,6 +21,17 @@ Official Pytorch Implementation of Avatar Forcing; Motion Latent Diffusion Forci
 Talking head generation creates lifelike avatars from static portraits for virtual communication and content creation. However, current models do not yet convey the feeling of truly interactive communication, often generating one-way responses that lack emotional engagement. We identify two key challenges toward truly interactive avatars: generating motion in real-time under causal constraints and learning expressive, vibrant reactions without additional labeled data. To address these challenges, we propose Avatar Forcing, a new framework for interactive head avatar generation that models real-time user-avatar interactions through diffusion forcing. This design allows the avatar to process real-time multimodal inputs, including the user's audio and motion, with low latency for instant reactions to both verbal and non-verbal cues such as speech, nods, and laughter. Furthermore, we introduce a direct preference optimization method that leverages synthetic losing samples constructed by dropping user conditions, enabling label-free learning of expressive interaction. Experimental results demonstrate that our framework enables real-time interaction with low latency (approximately 500ms), achieving 6.8x speedup compared to the baseline, and produces reactive and expressive avatar motion, which is preferred over 80% against the baseline.
 
 
+## Real-time streaming server (this fork)
+
+This fork adds an incremental engine and a WebSocket server that turn the
+released model into a live two-way conversation: one 10-frame / 400 ms block per
+call instead of `inference.py`'s offline whole-utterance rollout. The model and
+checkpoints are unchanged.
+
+**See [STREAMING.md](./STREAMING.md).** Three upstream files carry small
+environment fixes (transformers 5.x, torchvision 0.26, numpy 2.5); they are
+listed there.
+
 ## Getting Started
 ### Requirements
 

@@ -1,0 +1,1031 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<title>Live Avatar — real-time conversation</title>
+<style>
+  /* Design language lifted from apolinar.io: Helvetica, #f6f6f6 paper, 2px black
+     rules, hard offset shadows (no blur, no radius), one yellow highlight. */
+  :root{
+    --ink:#111;
+    --ink-2:#777;
+    --ink-3:#999;
+    --rule:#ddd;
+    --bg:#f6f6f6;
+    --paper:#fff;
+    --hi:#FFFB05;
+    --alert:#d33;
+    --font:"Helvetica Neue","Helvetica","Arial",sans-serif;
+    --mono:'Courier New',monospace;
+    --border:2px solid var(--ink);
+    --shadow:0.3ex 0.3ex var(--ink);
+    --shadow-lg:0.5ex 0.5ex var(--ink);
+    /* shared height of the transcript / prompt tab panes — see #transcript */
+    --pane-h:clamp(12em,52vh,32em);
+  }
+  *{box-sizing:border-box}
+  html{background:var(--bg);overflow-y:scroll}
+  body{
+    color:var(--ink);font-family:var(--font);font-size:100%;line-height:1.35;
+    margin:1em auto;padding:0 1em 2em 1em;max-width:64em;
+  }
+  a{text-decoration:none;color:var(--ink-2);border-bottom:1px solid var(--ink-2)}
+  a:hover{color:var(--ink);background:var(--hi);border-bottom-color:var(--ink)}
+
+  /* ---------------- header ---------------- */
+  header{
+    display:flex;align-items:flex-end;gap:1em;flex-wrap:wrap;
+    margin:1.5em 0 1em;
+  }
+  .title h1{margin:0;font-size:3em;line-height:1.05;font-weight:300;letter-spacing:-.01em}
+  .title p{
+    margin:.4em 0 0;color:var(--ink-2);font-family:var(--mono);
+    font-size:.95em;letter-spacing:.05em;
+  }
+  .spacer{flex:1}
+
+  /* ---------------- status chip ---------------- */
+  .pill{
+    display:inline-flex;align-items:center;gap:.6em;flex:none;
+    padding:.5ex 1ex;background:var(--paper);border:var(--border);
+    box-shadow:var(--shadow);font-family:var(--mono);font-size:.85em;
+    font-weight:700;text-transform:uppercase;letter-spacing:.08em;
+    transition:background .2s ease,color .2s ease;
+  }
+  .pill .dot{width:.6em;height:.6em;border-radius:50%;background:currentColor;flex:none}
+  .pill[data-s="offline"]{color:var(--ink-2)}
+  .pill[data-s="connecting"],.pill[data-s="thinking"]{background:var(--hi)}
+  .pill[data-s="speaking"]{background:var(--ink);color:var(--paper)}
+  .pill[data-s="error"],.pill[data-s="busy"]{color:var(--alert)}
+  .pill[data-s="listening"] .dot,.pill[data-s="connecting"] .dot{animation:breathe 1.9s ease-in-out infinite}
+  .pill[data-s="thinking"] .dot{animation:blink .75s steps(2,end) infinite}
+  .pill[data-s="speaking"] .dot{animation:breathe 1s ease-in-out infinite}
+  @keyframes breathe{0%,100%{opacity:.3}50%{opacity:1}}
+  @keyframes blink{0%,49%{opacity:1}50%,100%{opacity:.2}}
+
+  /* ---------------- setup bar ---------------- */
+  .setup{
+    display:flex;justify-content:space-between;align-items:flex-end;gap:2em;
+    flex-wrap:wrap;margin-bottom:2em;padding:1em 0;
+    border-top:1px solid var(--rule);border-bottom:1px solid var(--rule);
+  }
+  .field{display:flex;flex-direction:column;gap:.5em;min-width:0}
+  .field > label,.field .lbl{
+    font-family:var(--mono);font-size:.78em;text-transform:uppercase;
+    letter-spacing:.1em;color:var(--ink-2);
+  }
+  .field .row{display:flex;align-items:center;gap:.6em;flex-wrap:wrap}
+  input[type=text]{
+    font-family:var(--mono);font-size:.9em;color:var(--ink);background:var(--paper);
+    border:var(--border);box-shadow:var(--shadow);padding:.5ex 1ex;
+    width:26ch;max-width:100%;-webkit-appearance:none;border-radius:0;
+  }
+  input[type=text]::placeholder{color:var(--ink-3)}
+  input[type=text]:focus{outline:none;background:var(--hi)}
+  input[type=text]:disabled{opacity:.5;box-shadow:none}
+  input[type=file]{position:absolute;width:1px;height:1px;opacity:0;pointer-events:none}
+  .thumb{
+    width:44px;height:44px;flex:none;object-fit:cover;
+    border:var(--border);background:var(--paper);display:none;
+  }
+  .thumb.on{display:block}
+  .hint{font-size:.8em;color:var(--ink-3);font-family:var(--mono)}
+
+  /* ---------------- buttons ---------------- */
+  .button{
+    cursor:pointer;color:var(--ink);background:var(--paper);border:var(--border);
+    padding:.5ex 1ex;box-shadow:var(--shadow);margin:0 .3ex .3ex 0;
+    font-family:var(--font);font-size:1em;font-weight:700;transition:all .1s ease;
+    display:inline-flex;align-items:center;justify-content:center;gap:.5em;
+    -webkit-appearance:none;-webkit-border-radius:0;border-radius:0;
+  }
+  .button:active{box-shadow:none;margin:.3ex 0 0 .3ex}
+  .button:hover,.button:focus{color:var(--ink);background:var(--hi);border-color:var(--ink)}
+  .button:focus-visible{outline:2px solid var(--ink);outline-offset:2px}
+  .button.primary{background:var(--ink);color:var(--paper)}
+  .button.primary:hover{background:var(--hi);color:var(--ink)}
+  .button.stop{background:var(--hi);color:var(--ink)}
+  .button.stop:hover{background:var(--paper)}
+  .button[disabled]{opacity:.4;pointer-events:none;box-shadow:none}
+  .button[aria-pressed="true"]{background:var(--hi)}
+  .button svg{width:1.05em;height:1.05em;flex:none}
+  .controls{display:flex;gap:.6em;align-items:center;margin-top:1.2em}
+  .controls .primary{flex:1;padding:.8ex 1ex}
+
+  /* ---------------- layout ---------------- */
+  main{
+    display:grid;gap:2em;align-items:start;
+    grid-template-columns:minmax(0,1fr) minmax(0,19em);
+  }
+  @media (max-width:820px){main{grid-template-columns:minmax(0,1fr)}}
+
+  .panel{background:var(--paper);border:var(--border);box-shadow:var(--shadow);display:flex;flex-direction:column}
+  .panel-head{
+    display:flex;align-items:baseline;gap:.6em;padding:.7em 1em;
+    border-bottom:var(--border);
+  }
+  .panel-head h3{
+    margin:0;font-size:.85em;font-weight:700;text-transform:uppercase;
+    letter-spacing:.1em;font-family:var(--mono);
+  }
+  .panel-head .meta{margin-left:auto;font-family:var(--mono);font-size:.8em;color:var(--ink-2)}
+  /* Tabbed head: the tabs replace the <h3> in the same strip, so a tabbed panel
+     is exactly as tall as a plain one. */
+  .panel-head.tabs{padding:0;align-items:stretch}
+  .tab{
+    font-family:var(--mono);font-size:.85em;font-weight:700;text-transform:uppercase;
+    letter-spacing:.1em;color:var(--ink-2);background:var(--paper);
+    border:none;border-right:var(--border);padding:.7em 1em;cursor:pointer;
+    transition:background .15s ease,color .15s ease;
+  }
+  .tab:hover{background:var(--hi);color:var(--ink)}
+  .tab[aria-selected="true"]{background:var(--hi);color:var(--ink)}
+  .tab:focus-visible{outline:2px solid var(--ink);outline-offset:-4px}
+  /* flex-centred rather than top-padded, so it lines up with the button cells
+     that flank it once the strip is stretched to the tab height */
+  .panel-head.tabs .meta{margin-left:auto;padding:0 1em;display:flex;align-items:center}
+  /* Right-hand action cell in the tab strip: same padding as .tab, so it takes
+     its height from the strip and adds none of its own. */
+  .headbtn{
+    font-family:var(--mono);font-size:.75em;font-weight:700;text-transform:uppercase;
+    letter-spacing:.1em;color:var(--ink-2);background:var(--paper);
+    border:none;border-left:var(--border);padding:.7em 1em;cursor:pointer;
+    transition:background .15s ease,color .15s ease;
+  }
+  .headbtn:hover{background:var(--hi);color:var(--ink)}
+  .headbtn:focus-visible{outline:2px solid var(--ink);outline-offset:-4px}
+  .headbtn[disabled]{opacity:.35;pointer-events:none}
+
+  /* ---------------- avatar stage ---------------- */
+  .stage{
+    position:relative;aspect-ratio:1/1;width:100%;background:#e9e9e9;overflow:hidden;
+  }
+  #avatar{position:absolute;inset:0;width:100%;height:100%;display:block;object-fit:cover}
+  #avatar{transition:filter .7s ease}
+  .stage.idle #avatar{filter:grayscale(1) contrast(.55) brightness(1.18)}
+  .stage.speaking::after{
+    content:"";position:absolute;inset:0;pointer-events:none;z-index:4;
+    box-shadow:inset 0 0 0 6px var(--hi);animation:onair 1.6s ease-in-out infinite;
+  }
+  @keyframes onair{0%,100%{opacity:.45}50%{opacity:1}}
+
+  .overlay-center{
+    position:absolute;inset:0;display:flex;flex-direction:column;
+    align-items:center;justify-content:center;gap:1em;text-align:center;
+    padding:1.5em;z-index:5;background:rgba(246,246,246,.92);
+  }
+  .overlay-center h2{margin:0;font-size:1.5em;font-weight:300;line-height:1.15}
+  .overlay-center p{margin:0;max-width:34ch;font-size:.9em;line-height:1.5;color:var(--ink-2)}
+  .overlay-center.hidden{display:none}
+  .spinner{
+    width:1.4em;height:1.4em;border-radius:50%;
+    border:3px solid var(--rule);border-top-color:var(--ink);
+    animation:spin .8s linear infinite;
+  }
+  @keyframes spin{to{transform:rotate(360deg)}}
+
+  /* ---------------- webcam self-view (subordinate to the stage) ---------- */
+  .selfview .pip{position:relative;aspect-ratio:1/1;width:100%;background:#e9e9e9;overflow:hidden}
+  .selfview .pip video{width:100%;height:100%;object-fit:cover;transform:scaleX(-1);display:block;opacity:0;transition:opacity .3s}
+  .selfview .pip.on video{opacity:1}
+  .miclevel{
+    display:flex;align-items:center;gap:.6em;padding:.6em 1em;border-top:1px solid var(--rule);
+    font-family:var(--mono);font-size:.78em;text-transform:uppercase;letter-spacing:.08em;color:var(--ink-2);
+  }
+  .meter{flex:1;height:.7em;border:1px solid var(--ink);background:var(--paper);overflow:hidden}
+  .meter i{display:block;height:100%;width:0%;background:var(--hi);transition:width .08s linear}
+  .miclevel.muted{color:var(--alert)}
+  .miclevel.muted .meter i{background:var(--rule)}
+
+  /* ---------------- transcript / prompt panes ---------------- */
+  aside{display:flex;flex-direction:column;gap:2em;min-width:0}
+  /* Both tab panes are pinned to the SAME height, so switching tabs cannot move
+     a single pixel of the page and neither pane can grow it. Everything that
+     overflows scrolls inside its own pane. */
+  #transcript,#promptPane{height:var(--pane-h)}
+  #transcript{
+    overflow-y:auto;padding:1em;display:flex;flex-direction:column;gap:.9em;
+  }
+  #promptPane{display:flex;flex-direction:column;min-width:0}
+  /* both panes set `display`, which would otherwise beat the [hidden] default */
+  #transcript[hidden],#promptPane[hidden]{display:none}
+  #promptBox{
+    flex:1;min-height:0;resize:none;overflow-y:auto;width:100%;
+    font-family:var(--mono);font-size:.78em;line-height:1.5;color:var(--ink);
+    background:var(--paper);border:none;border-bottom:1px solid var(--rule);
+    padding:1em;-webkit-appearance:none;border-radius:0;
+  }
+  #promptBox:focus{outline:none;background:#fffef0}
+  .promptbar{
+    display:flex;align-items:center;gap:.6em;padding:.6em 1em;flex:none;
+    font-family:var(--mono);font-size:.72em;color:var(--ink-2);
+  }
+  .promptbar .button{font-family:var(--mono);font-size:1em;text-transform:uppercase;letter-spacing:.06em}
+  .promptbar .note{margin-left:auto;text-align:right}
+  .promptbar .note.dirty{color:var(--ink);background:var(--hi)}
+  .turn{display:flex;flex-direction:column;gap:.3em;max-width:94%}
+  .turn .who{
+    font-family:var(--mono);font-size:.7em;letter-spacing:.12em;text-transform:uppercase;
+    color:var(--ink-2);
+  }
+  .turn .bubble{
+    padding:.6em .8em;font-size:.9em;line-height:1.45;background:var(--paper);
+    border:var(--border);box-shadow:var(--shadow);white-space:pre-wrap;word-break:break-word;
+  }
+  .turn.user{align-self:flex-end;align-items:flex-end}
+  .turn.avatar .bubble{background:var(--hi)}
+  .turn.partial .bubble{opacity:.65;font-style:italic;border-style:dashed;box-shadow:none}
+  .turn.system{align-self:center;max-width:100%;align-items:center}
+  .turn.system .bubble{
+    background:none;border:none;box-shadow:none;padding:0;color:var(--ink-2);
+    font-family:var(--mono);font-size:.75em;text-align:center;
+  }
+  .empty{
+    margin:auto;text-align:center;color:var(--ink-2);font-size:.85em;
+    line-height:1.6;padding:1.5em .5em;font-family:var(--mono);
+  }
+
+  /* ---------------- diagnostics ---------------- */
+  .diag{padding:.8em 1em;display:grid;grid-template-columns:1fr 1fr;gap:.35em 1.2em}
+  .diag div{display:flex;justify-content:space-between;gap:.5em;font-family:var(--mono);font-size:.75em;color:var(--ink-2)}
+  .diag b{color:var(--ink);font-weight:700}
+
+  footer{
+    margin-top:2em;padding-top:1em;border-top:1px solid var(--rule);
+    display:flex;gap:1em;flex-wrap:wrap;align-items:center;
+    font-family:var(--mono);font-size:.75em;color:var(--ink-2);
+  }
+  kbd{border:1px solid var(--ink-2);padding:0 .4ex;color:var(--ink)}
+  .sr{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0)}
+  @media (prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
+  @media (max-width:820px){
+    .title h1{font-size:2.2em}
+    .setup{flex-direction:column;align-items:stretch;gap:1.2em}
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="title">
+    <h1>Live Avatar</h1>
+    <p>real-time conversational video</p>
+  </div>
+  <div class="spacer"></div>
+  <div class="pill" id="pill" data-s="offline" role="status" aria-live="polite">
+    <span class="dot"></span><span id="pillText">Offline</span>
+  </div>
+</header>
+
+<div class="setup">
+  <div class="field">
+    <span class="lbl">Reference photo</span>
+    <div class="row">
+      <input type="file" id="refInput" accept="image/*" />
+      <button class="button" id="refBtn" type="button">Choose a portrait…</button>
+      <img class="thumb" id="refThumb" alt="" />
+      <button class="button" id="refClear" type="button" style="display:none">Reset</button>
+      <span class="hint" id="refName">default face</span>
+    </div>
+  </div>
+  <div class="field">
+    <label for="voiceInput">ElevenLabs voice</label>
+    <div class="row">
+      <input type="text" id="voiceInput" autocomplete="off" spellcheck="false"
+             placeholder="voice ID — leave empty for default" />
+    </div>
+  </div>
+</div>
+
+<main>
+  <section>
+    <div class="panel">
+      <div class="panel-head">
+        <h3>Avatar</h3>
+        <span class="meta" id="clockLbl">--:--</span>
+      </div>
+      <div class="stage idle" id="stage">
+        <canvas id="avatar" width="512" height="512"></canvas>
+        <div class="overlay-center" id="overlay">
+          <div id="ovIcon" class="sr"></div>
+          <h2 id="ovTitle">Ready when you are</h2>
+          <p id="ovText">Press <strong>Start session</strong> and allow camera + microphone.
+            Your webcam drives the avatar's head motion — just talk normally.</p>
+        </div>
+      </div>
+    </div>
+
+    <div class="controls">
+      <button class="button primary" id="startBtn">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round"><path d="M23 7l-7 5 7 5V7z"/><rect x="1" y="5" width="15" height="14" rx="2"/></svg>
+        <span id="startLbl">Start session</span>
+      </button>
+      <button class="button" id="muteBtn" aria-pressed="false" title="Mute microphone (M)" disabled>
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round"><path d="M12 1a3 3 0 00-3 3v8a3 3 0 006 0V4a3 3 0 00-3-3z"/><path d="M19 10v2a7 7 0 01-14 0v-2"/><line x1="12" y1="19" x2="12" y2="23"/></svg>
+        <span class="sr">Toggle microphone</span>
+      </button>
+    </div>
+  </section>
+
+  <aside>
+    <div class="panel selfview">
+      <div class="panel-head">
+        <h3>You</h3>
+        <span class="meta" id="pipTag">webcam</span>
+      </div>
+      <div class="pip" id="pip">
+        <video id="webcam" playsinline autoplay muted></video>
+      </div>
+      <div class="miclevel" id="stagebar">
+        <span>mic</span>
+        <span class="meter" aria-label="microphone level"><i id="micBar"></i></span>
+      </div>
+    </div>
+
+    <div class="panel">
+      <div class="panel-head tabs" role="tablist" aria-label="Transcript or system prompt">
+        <button class="tab" id="tabTranscript" role="tab" aria-selected="true"
+                aria-controls="transcript" type="button">Transcript</button>
+        <button class="tab" id="tabPrompt" role="tab" aria-selected="false"
+                aria-controls="promptPane" type="button">Prompt</button>
+        <span class="meta" id="turnCount">0 turns</span>
+        <button class="headbtn" id="clearBtn" type="button" disabled
+                aria-label="Clear the transcript display"
+                title="Clears the display only — the avatar still remembers the conversation">Clear</button>
+      </div>
+      <div id="transcript" role="tabpanel" aria-labelledby="tabTranscript">
+        <div class="empty" id="emptyState">Nothing yet.<br>Start a session and say hello.</div>
+      </div>
+      <div id="promptPane" role="tabpanel" aria-labelledby="tabPrompt" hidden>
+        <textarea id="promptBox" spellcheck="false" maxlength="8192"
+                  aria-label="LLM system prompt"></textarea>
+        <div class="promptbar">
+          <button class="button" id="promptReset" type="button">Reset</button>
+          <span class="note" id="promptNote">applies on next connect</span>
+        </div>
+      </div>
+    </div>
+
+    <div class="panel">
+      <div class="panel-head"><h3>Diagnostics</h3></div>
+      <div class="diag">
+        <div><span>blocks</span><b id="dBlocks">0</b></div>
+        <div><span>video fps</span><b id="dFps">0</b></div>
+        <div><span>a-buffer</span><b id="dBuf">0 ms</b></div>
+        <div><span>underruns</span><b id="dUnder">0</b></div>
+        <div><span>up kb/s</span><b id="dUp">0</b></div>
+        <div><span>down kb/s</span><b id="dDown">0</b></div>
+        <div><span>mic rate</span><b id="dMic">--</b></div>
+        <div><span>rtt</span><b id="dRtt">--</b></div>
+      </div>
+    </div>
+  </aside>
+</main>
+
+<footer>
+  <span>512&times;512 &middot; 25 fps &middot; 16 kHz</span>
+  <span><kbd>M</kbd> mute &middot; <kbd>Space</kbd> start / stop</span>
+  <span class="spacer"></span>
+  <span id="verLbl"></span>
+</footer>
+
+<script>
+"use strict";
+/* ===========================================================================
+   Live Avatar client — vanilla JS, no dependencies.
+
+   Protocol (server/web.py), little-endian, first byte = tag:
+     C->S 0x01 [int16 pcm mono 16 kHz]          ~every 100 ms
+     C->S 0x02 [jpeg]                           ~25 fps, 384 px, q0.6
+     C->S 0x03 [jpeg]                           once, right after session_config
+     S->C 0x11 [u32 block][int16 pcm x 6400]    400 ms of avatar audio
+     S->C 0x12 [u32 block][u8 frame][jpeg]      10 frames per block
+     both: JSON text = control + ConversationBrain events
+
+   Session handshake, in this exact order on every (re)connect:
+     {"type":"hello"}
+     -> {"type":"session_config", voice_id, system_prompt, reference}
+     -> 0x03 (only when reference is true).
+   The server gates brain construction and engine priming on it, so the voice id,
+   the system prompt and the uploaded face are all in force before the first
+   generated block. The built-in prompt comes back from GET /defaults (and in the
+   server's own `hello`) to seed the editor.
+   =========================================================================== */
+
+const FPS = 25, SR = 16000, BLOCK_FRAMES = 10;
+const BLOCK_SEC = BLOCK_FRAMES / FPS;      // 0.400 s
+const JITTER = 0.80;                       // playback jitter buffer (s)
+const MIC_CHUNK = 1600;                    // 100 ms @ 16 kHz
+const CAM_SIZE = 384, CAM_Q = 0.6, CAM_FPS = 25;
+const UP_BACKPRESSURE = 3 * 1024 * 1024;   // drop cam frames above this
+// Reference upload: the server face-crops to 512 anyway, so 1024 px is already
+// generous; keeps the one-shot 0x03 frame around 150-250 KB.
+const REF_MAX = 1024, REF_Q = 0.9;
+
+const $ = (id) => document.getElementById(id);
+const els = {};
+["pill","pillText","stage","avatar","overlay","ovTitle","ovText","ovIcon","pip","pipTag",
+ "webcam","stagebar","micBar","clockLbl","startBtn","startLbl","muteBtn","transcript",
+ "emptyState","turnCount","dBlocks","dFps","dBuf","dUnder","dUp","dDown","dMic","dRtt",
+ "verLbl","refInput","refBtn","refThumb","refClear","refName","voiceInput",
+ "tabTranscript","tabPrompt","promptPane","promptBox","promptReset","promptNote","clearBtn"]
+ .forEach((k) => els[k] = $(k));
+
+const S = {
+  running:false, muted:false, ws:null, closedByUser:false,
+  retries:0, retryTimer:null,
+  media:null, micCtx:null, micNode:null, micRate:0,
+  playCtx:null, gain:null,
+  epoch:null,              // playCtx.currentTime that corresponds to stream position 0
+  underruns:0, blocksRecv:0, framesDrawn:0,
+  pendingFrames:[], lastDrawnGi:-1,
+  bytesUp:0, bytesDown:0, rtt:null,
+  state:"offline", camTimer:null, camBusy:false,
+  curAvatarBubble:null, curPartial:null, turns:0, sessionStarted:0,
+  refBytes:null, refURL:null,   // re-encoded reference upload (null = server default)
+  defaultPrompt:"", promptDirty:false, sentPrompt:null,
+};
+
+/* ---------------------------------------------------------------- status --- */
+const LABEL = { offline:"Offline", connecting:"Connecting…", ready:"Ready",
+  listening:"Listening", thinking:"Thinking", speaking:"Speaking",
+  error:"Error", busy:"Busy" };
+function setStatus(s, note){
+  S.state = s;
+  els.pill.dataset.s = s;
+  els.pillText.textContent = note || LABEL[s] || s;
+  els.stage.classList.toggle("speaking", s === "speaking");
+}
+function showOverlay(title, html, spinner){
+  els.overlay.classList.remove("hidden");
+  els.ovTitle.textContent = title;
+  els.ovText.innerHTML = html;
+  els.ovIcon.className = spinner ? "spinner" : "sr";
+}
+function hideOverlay(){
+  if (!els.overlay.classList.contains("hidden")) els.overlay.classList.add("hidden");
+  els.stage.classList.remove("idle");
+}
+
+/* ------------------------------------------------------------ transcript --- */
+const EMPTY_HTML = "Nothing yet.<br>Start a session and say hello.";
+function updateClearState(){ els.clearBtn.disabled = els.emptyState !== null; }
+function clearTranscript(){
+  // Display only: the brain keeps its own history, so the avatar does not forget
+  // (hence the button's title). Dropping the in-flight bubble references is what
+  // keeps this safe -- the next partial / delta simply opens a fresh bubble
+  // instead of writing into a node that is no longer in the document.
+  els.transcript.textContent = "";
+  const empty = document.createElement("div");
+  empty.className = "empty";
+  empty.id = "emptyState";
+  empty.innerHTML = EMPTY_HTML;
+  els.transcript.appendChild(empty);
+  els.emptyState = empty;
+  S.curPartial = null;
+  S.curAvatarBubble = null;
+  S.turns = 0;
+  els.turnCount.textContent = "0 turns";
+  updateClearState();
+}
+els.clearBtn.addEventListener("click", clearTranscript);
+
+function bubble(kind, who, text){
+  if (els.emptyState){ els.emptyState.remove(); els.emptyState = null; updateClearState(); }
+  const wrap = document.createElement("div");
+  wrap.className = "turn " + kind;
+  if (who){
+    const w = document.createElement("div"); w.className = "who"; w.textContent = who;
+    wrap.appendChild(w);
+  }
+  const b = document.createElement("div"); b.className = "bubble"; b.textContent = text;
+  wrap.appendChild(b);
+  els.transcript.appendChild(wrap);
+  els.transcript.scrollTop = els.transcript.scrollHeight;
+  return { wrap, b };
+}
+function systemLine(text){ bubble("system", null, text); }
+function onUserTranscript(text, final){
+  if (!final){
+    if (!S.curPartial) S.curPartial = bubble("user partial", "you", text);
+    else S.curPartial.b.textContent = text;
+    els.transcript.scrollTop = els.transcript.scrollHeight;
+    return;
+  }
+  if (S.curPartial){
+    S.curPartial.wrap.classList.remove("partial");
+    S.curPartial.b.textContent = text;
+  } else bubble("user", "you", text);
+  S.curPartial = null;
+  S.curAvatarBubble = null;
+  S.turns++;
+  els.turnCount.textContent = S.turns + (S.turns === 1 ? " turn" : " turns");
+}
+function onAvatarText(chunk){
+  if (!S.curAvatarBubble) S.curAvatarBubble = bubble("avatar", "avatar", "");
+  S.curAvatarBubble.b.textContent += chunk;
+  els.transcript.scrollTop = els.transcript.scrollHeight;
+}
+
+/* =========================================================================
+   Reference photo: decode -> fit inside REF_MAX -> JPEG. Sent once per
+   connect as tag 0x03; the server face-crops it and recomputes the identity
+   latents before it primes, so nothing here touches the 400 ms block path.
+   ========================================================================= */
+async function prepareReference(file){
+  const bmp = await createImageBitmap(file);
+  const k = Math.min(1, REF_MAX / Math.max(bmp.width, bmp.height));
+  const w = Math.max(1, Math.round(bmp.width * k));
+  const h = Math.max(1, Math.round(bmp.height * k));
+  const c = document.createElement("canvas");
+  c.width = w; c.height = h;
+  c.getContext("2d", { alpha:false }).drawImage(bmp, 0, 0, w, h);
+  if (bmp.close) bmp.close();
+  const blob = await new Promise((res) => c.toBlob(res, "image/jpeg", REF_Q));
+  if (!blob) throw new Error("could not encode image");
+  return { bytes: await blob.arrayBuffer(), url: URL.createObjectURL(blob) };
+}
+function clearReference(){
+  if (S.refURL) URL.revokeObjectURL(S.refURL);
+  S.refBytes = null; S.refURL = null;
+  els.refInput.value = "";
+  els.refThumb.classList.remove("on");
+  els.refThumb.removeAttribute("src");
+  els.refClear.style.display = "none";
+  els.refName.textContent = "default face";
+}
+els.refBtn.addEventListener("click", () => els.refInput.click());
+els.refClear.addEventListener("click", clearReference);
+els.refInput.addEventListener("change", async () => {
+  const file = els.refInput.files && els.refInput.files[0];
+  if (!file) return;
+  els.refName.textContent = "reading…";
+  try {
+    const out = await prepareReference(file);
+    if (S.refURL) URL.revokeObjectURL(S.refURL);
+    S.refBytes = out.bytes; S.refURL = out.url;
+    els.refThumb.src = out.url;
+    els.refThumb.classList.add("on");
+    els.refClear.style.display = "";
+    els.refName.textContent = Math.round(out.bytes.byteLength / 1024) + " KB";
+  } catch (e){
+    clearReference();
+    els.refName.textContent = "unreadable image";
+  }
+});
+function lockSetup(locked){
+  els.refBtn.disabled = locked;
+  els.refClear.disabled = locked;
+  els.voiceInput.disabled = locked;
+}
+
+/* =========================================================================
+   Transcript / Prompt tabs.
+
+   Both panes are pinned to --pane-h and live inside the one panel, so this
+   only flips `hidden`: the panel keeps its exact footprint and the page height
+   is identical in either tab state. The prompt itself is a per-session value
+   (server/web.py session_config), so it is applied at connect time, not
+   hot-swapped — ConversationBrain reads cfg.system_prompt when it builds each
+   turn's message list, and a mid-turn swap would leave the history half in one
+   persona and half in another.
+   ========================================================================= */
+function showTab(which){
+  const wantPrompt = which === "prompt";
+  els.tabPrompt.setAttribute("aria-selected", String(wantPrompt));
+  els.tabTranscript.setAttribute("aria-selected", String(!wantPrompt));
+  els.promptPane.hidden = !wantPrompt;
+  els.transcript.hidden = wantPrompt;
+  // hidden, not removed: both keep their boxes so the strip cannot reflow
+  els.turnCount.style.visibility = wantPrompt ? "hidden" : "";
+  els.clearBtn.style.visibility = wantPrompt ? "hidden" : "";
+  if (wantPrompt) els.promptBox.focus();
+}
+function promptValue(){ return els.promptBox.value.trim(); }
+function promptOverride(){
+  // "" tells the server to use its built-in prompt (and keeps custom_prompt honest)
+  return promptValue() === S.defaultPrompt.trim() ? "" : promptValue();
+}
+function updatePromptNote(){
+  const stale = S.running && S.sentPrompt !== null && promptValue() !== S.sentPrompt;
+  els.promptNote.textContent = stale ? "restart the session to apply"
+                                     : "applies on next connect";
+  els.promptNote.classList.toggle("dirty", stale);
+}
+function setDefaultPrompt(text, maxChars){
+  if (typeof text !== "string" || !text) return;
+  S.defaultPrompt = text;
+  if (maxChars) els.promptBox.maxLength = maxChars;
+  if (!S.promptDirty) els.promptBox.value = text;   // never clobber a user edit
+  updatePromptNote();
+}
+els.tabTranscript.addEventListener("click", () => showTab("transcript"));
+els.tabPrompt.addEventListener("click", () => showTab("prompt"));
+els.promptBox.addEventListener("input", () => { S.promptDirty = true; updatePromptNote(); });
+els.promptReset.addEventListener("click", () => {
+  els.promptBox.value = S.defaultPrompt;
+  S.promptDirty = false;
+  updatePromptNote();
+  els.promptBox.focus();
+});
+// Seed the editor with the server's real prompt before any session exists, so
+// the user always edits from the default rather than a blank box.
+fetch(new URL("./defaults", window.location.href), { cache:"no-store" })
+  .then((r) => r.json())
+  .then((d) => setDefaultPrompt(d.system_prompt, d.max_prompt_chars))
+  .catch(() => {});
+
+/* =========================================================================
+   Microphone -> AudioWorklet -> mono 16 kHz int16, ~100 ms chunks.
+   The worklet resamples from the hardware rate (linear interpolation, with
+   fractional carry across render quanta) so we stay correct whether or not
+   AudioContext({sampleRate:16000}) is honoured by the browser.
+   ========================================================================= */
+const MIC_WORKLET = `
+class MicCapture extends AudioWorkletProcessor {
+  constructor(opts){
+    super();
+    const o = (opts && opts.processorOptions) || {};
+    this.target = o.target || 16000;
+    this.chunk  = o.chunk  || 1600;
+    this.ratio  = sampleRate / this.target;   // 1.0 when the ctx honours 16 kHz
+    this.q = new Float32Array(16384); this.qn = 0; this.frac = 0;
+    this.out = new Int16Array(this.chunk); this.on = 0;
+    this.acc = 0; this.accN = 0;
+  }
+  process(inputs){
+    const ch = inputs[0] && inputs[0][0];
+    if (!ch) return true;
+    for (let i = 0; i < ch.length; i++) this.acc += ch[i] * ch[i];
+    this.accN += ch.length;
+    if (this.qn + ch.length > this.q.length){ this.qn = 0; this.frac = 0; }  // guard
+    this.q.set(ch, this.qn); this.qn += ch.length;
+    let idx = this.frac;
+    while (idx + 1 < this.qn){
+      const i0 = idx | 0, t = idx - i0;
+      let s = this.q[i0] * (1 - t) + this.q[i0 + 1] * t;
+      if (s > 1) s = 1; else if (s < -1) s = -1;
+      this.out[this.on++] = s < 0 ? s * 32768 : s * 32767;
+      if (this.on === this.chunk){
+        const rms = Math.sqrt(this.acc / Math.max(1, this.accN));
+        this.acc = 0; this.accN = 0;
+        this.port.postMessage({ pcm: this.out.slice(0), rms: rms, rate: sampleRate });
+        this.on = 0;
+      }
+      idx += this.ratio;
+    }
+    // idx may land past the end of the queue (ratio > 1): clamp, and let the
+    // leftover fraction skip that many of the *next* incoming samples.
+    let consumed = idx | 0;
+    if (consumed > this.qn) consumed = this.qn;
+    if (consumed > 0){
+      this.q.copyWithin(0, consumed, this.qn);
+      this.qn -= consumed;
+    }
+    this.frac = idx - consumed;
+    return true;
+  }
+}
+registerProcessor('mic-capture', MicCapture);
+`;
+
+async function startMic(stream){
+  let ctx;
+  try { ctx = new AudioContext({ sampleRate: SR, latencyHint: "interactive" }); }
+  catch (e){ ctx = new AudioContext({ latencyHint: "interactive" }); }
+  await ctx.resume();
+  const url = URL.createObjectURL(new Blob([MIC_WORKLET], { type: "text/javascript" }));
+  try { await ctx.audioWorklet.addModule(url); } finally { URL.revokeObjectURL(url); }
+  const src = ctx.createMediaStreamSource(stream);
+  const node = new AudioWorkletNode(ctx, "mic-capture", {
+    numberOfInputs: 1, numberOfOutputs: 0, channelCount: 1,
+    processorOptions: { target: SR, chunk: MIC_CHUNK },
+  });
+  node.port.onmessage = (ev) => {
+    const d = ev.data;
+    if (d.rate !== S.micRate){
+      S.micRate = d.rate;
+      els.dMic.textContent = (d.rate/1000).toFixed(1) + "k" + (d.rate === SR ? "" : "→16k");
+    }
+    els.micBar.style.width = (S.muted ? 0 : Math.min(1, d.rms * 6) * 100).toFixed(0) + "%";
+    sendBin(0x01, d.pcm.buffer);
+  };
+  src.connect(node);
+  S.micCtx = ctx; S.micNode = node;
+}
+
+/* =========================================================================
+   Webcam -> square 384 canvas -> JPEG q0.6 -> tag 0x02, ~25 fps
+   ========================================================================= */
+const camCanvas = document.createElement("canvas");
+camCanvas.width = camCanvas.height = CAM_SIZE;
+const camCtx = camCanvas.getContext("2d", { alpha:false });
+function grabFrame(){
+  const v = els.webcam;
+  if (!v.videoWidth || S.camBusy) return;
+  if (!S.ws || S.ws.readyState !== 1) return;
+  if (S.ws.bufferedAmount > UP_BACKPRESSURE) return;
+  const vw = v.videoWidth, vh = v.videoHeight, s = Math.min(vw, vh);
+  camCtx.drawImage(v, (vw - s)/2, (vh - s)/2, s, s, 0, 0, CAM_SIZE, CAM_SIZE);
+  S.camBusy = true;
+  camCanvas.toBlob(async (blob) => {
+    try { if (blob) sendBin(0x02, await blob.arrayBuffer()); }
+    finally { S.camBusy = false; }
+  }, "image/jpeg", CAM_Q);
+}
+
+/* =========================================================================
+   Playback clock.
+   `epoch` = the AudioContext time at which stream position 0 plays. Audio
+   block b is scheduled at epoch + b*0.4 (back-to-back, no gaps). Video frame
+   f of block b is drawn when (currentTime - epoch) >= (b*10+f)/25.
+   On underrun we push `epoch` forward — that inserts silence AND slides the
+   video target by the same amount, so audio and video can never desync.
+   ========================================================================= */
+function ensurePlayback(){
+  if (S.playCtx) return S.playCtx;
+  const ctx = new AudioContext({ latencyHint:"playback" });
+  const g = ctx.createGain(); g.gain.value = 1; g.connect(ctx.destination);
+  S.playCtx = ctx; S.gain = g;
+  return ctx;
+}
+function onAudioBlock(block, pcm){
+  const ctx = ensurePlayback();
+  if (ctx.state === "suspended") ctx.resume();
+  const buf = ctx.createBuffer(1, pcm.length, SR);   // WebAudio resamples to device rate
+  const ch = buf.getChannelData(0);
+  for (let i = 0; i < pcm.length; i++) ch[i] = pcm[i] / 32768;
+
+  if (S.epoch === null) S.epoch = ctx.currentTime + JITTER;
+  let at = S.epoch + block * BLOCK_SEC;
+  const now = ctx.currentTime;
+  if (at < now + 0.015){                 // late: underrun
+    S.underruns++;
+    S.epoch += (now + 0.12) - at;        // insert silence, keep A/V locked
+    at = S.epoch + block * BLOCK_SEC;
+    els.dUnder.textContent = S.underruns;
+  }
+  const src = ctx.createBufferSource();
+  src.buffer = buf; src.connect(S.gain); src.start(at);
+  S.blocksRecv++;
+  els.dBlocks.textContent = S.blocksRecv;
+  els.dBuf.textContent = Math.max(0, Math.round((at + BLOCK_SEC - now) * 1000)) + " ms";
+}
+
+async function onVideoFrame(block, frame, bytes){
+  const gi = block * BLOCK_FRAMES + frame;
+  if (gi <= S.lastDrawnGi) return;                    // clock already past it
+  let bmp;
+  try { bmp = await createImageBitmap(new Blob([bytes], { type:"image/jpeg" })); }
+  catch (e){ return; }
+  const arr = S.pendingFrames;
+  let i = arr.length;
+  while (i > 0 && arr[i-1].gi > gi) i--;
+  arr.splice(i, 0, { gi, bmp });
+  while (arr.length > 90){ const d = arr.shift(); if (d.bmp.close) d.bmp.close(); }
+}
+
+const actx = els.avatar.getContext("2d", { alpha:false });
+function renderLoop(){
+  requestAnimationFrame(renderLoop);
+  const arr = S.pendingFrames;
+  if (!arr.length) return;
+  let target;
+  if (S.playCtx && S.epoch !== null){
+    const pos = S.playCtx.currentTime - S.epoch;      // seconds since stream start
+    target = pos < 0 ? -1 : Math.floor(pos * FPS);
+  } else {
+    target = arr[0].gi;                               // no audio clock yet
+  }
+  let pick = -1;
+  for (let i = 0; i < arr.length; i++){ if (arr[i].gi <= target) pick = i; else break; }
+  if (pick < 0) return;
+  for (let i = 0; i < pick; i++){ const d = arr[i]; if (d.bmp.close) d.bmp.close(); }
+  const item = arr[pick];
+  arr.splice(0, pick + 1);
+  actx.drawImage(item.bmp, 0, 0, els.avatar.width, els.avatar.height);
+  if (item.bmp.close) item.bmp.close();
+  S.lastDrawnGi = item.gi;
+  S.framesDrawn++;
+  hideOverlay();
+}
+requestAnimationFrame(renderLoop);
+
+/* --------------------------------------------------------------- sockets --- */
+function wsURL(){
+  const u = new URL("./ws", window.location.href);   // survives proxy path prefixes
+  u.protocol = (window.location.protocol === "https:") ? "wss:" : "ws:";
+  u.search = ""; u.hash = "";
+  return u.toString();
+}
+function sendBin(tag, payload){
+  if (!S.ws || S.ws.readyState !== 1) return;
+  const body = new Uint8Array(payload);
+  const out = new Uint8Array(body.length + 1);
+  out[0] = tag; out.set(body, 1);
+  S.ws.send(out);
+  S.bytesUp += out.length;
+}
+function sendJSON(obj){ if (S.ws && S.ws.readyState === 1) S.ws.send(JSON.stringify(obj)); }
+
+function connect(){
+  clearTimeout(S.retryTimer);
+  setStatus("connecting", S.retries ? "Reconnecting…" : "Connecting…");
+  const ws = new WebSocket(wsURL());
+  ws.binaryType = "arraybuffer";
+  S.ws = ws;
+
+  ws.onopen = () => {
+    S.retries = 0;
+    sendJSON({ type:"hello", ua:navigator.userAgent.slice(0,80), fps:FPS });
+    // Must precede the first 0x02 frame: the server holds priming (and the
+    // brain) until this handshake completes.
+    sendJSON({ type:"session_config",
+               voice_id: els.voiceInput.value.trim(),
+               system_prompt: promptOverride(),
+               reference: !!S.refBytes });
+    S.sentPrompt = promptValue();
+    updatePromptNote();
+    if (S.refBytes) sendBin(0x03, S.refBytes);
+    showOverlay("Waking the avatar", "Priming the model with your first frame…", true);
+  };
+  ws.onmessage = (ev) => {
+    if (typeof ev.data === "string"){ onJSON(ev.data); return; }
+    const buf = ev.data;
+    S.bytesDown += buf.byteLength;
+    const dv = new DataView(buf);
+    const tag = dv.getUint8(0);
+    if (tag === 0x11){
+      // NOTE: the 0x11 header is 5 bytes, so the PCM starts at an ODD offset --
+      // `new Int16Array(buf, 5, n)` would throw (byteOffset must be a multiple
+      // of 2). Copy the payload out with slice() instead (12.8 KB, 2.5x/s).
+      const n = (buf.byteLength - 5) >> 1;
+      onAudioBlock(dv.getUint32(1, true), new Int16Array(buf.slice(5, 5 + n * 2)));
+    } else if (tag === 0x12){
+      onVideoFrame(dv.getUint32(1, true), dv.getUint8(5), new Uint8Array(buf, 6));
+    }
+  };
+  ws.onerror = () => {};
+  ws.onclose = (ev) => {
+    if (S.closedByUser || !S.running){ setStatus("offline"); return; }
+    if (ev.code === 1013){
+      setStatus("busy", "Session in use");
+      showOverlay("Someone else is live",
+        "This demo runs one session at a time. Retrying…", true);
+    } else {
+      setStatus("connecting", "Reconnecting…");
+    }
+    const delay = Math.min(8000, 500 * Math.pow(1.7, S.retries++));
+    S.retryTimer = setTimeout(() => { if (S.running) reconnect(); }, delay);
+  };
+}
+function reconnect(){
+  S.epoch = null; S.lastDrawnGi = -1; S.blocksRecv = 0;
+  for (const f of S.pendingFrames) if (f.bmp.close) f.bmp.close();
+  S.pendingFrames = [];
+  connect();
+}
+
+function onJSON(text){
+  let m; try { m = JSON.parse(text); } catch (e){ return; }
+  switch (m.type){
+    case "hello":
+      els.verLbl.textContent = (m.server || "server") + " · " + (m.fps || FPS) + " fps";
+      setDefaultPrompt(m.system_prompt, m.max_prompt_chars);
+      break;
+    case "ready":
+      setStatus("ready");
+      if (!S.sessionStarted){ S.sessionStarted = Date.now(); systemLine("Session started"); }
+      break;
+    case "state": setStatus(m.value); break;
+    case "user_transcript": onUserTranscript(m.text || "", !!m.final); break;
+    case "avatar_text": onAvatarText(m.text || ""); break;
+    case "reference":
+      systemLine(m.ok ? "Using your reference photo" : ("⚠ " + (m.text || "reference rejected")));
+      break;
+    case "error":
+      if (m.code === "busy") setStatus("busy", "Session in use");
+      else {
+        setStatus("error", "Error");
+        showOverlay("Something went wrong", m.text || "Unknown error", false);
+      }
+      systemLine("⚠ " + (m.text || "error"));
+      break;
+    case "pong":
+      if (m.t){ S.rtt = Date.now() - m.t; els.dRtt.textContent = S.rtt + " ms"; }
+      break;
+  }
+}
+
+/* ----------------------------------------------------------- session ctl --- */
+async function startSession(){
+  if (S.running) return;
+  S.closedByUser = false;
+  els.startBtn.disabled = true;
+  showOverlay("Requesting camera & microphone", "Your browser will ask for permission.", true);
+  let stream;
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({
+      audio: { echoCancellation:true, noiseSuppression:true, autoGainControl:true,
+               channelCount:1, sampleRate:SR },
+      video: { width:{ ideal:640 }, height:{ ideal:480 },
+               frameRate:{ ideal:CAM_FPS, max:30 }, facingMode:"user" },
+    });
+  } catch (e){
+    els.startBtn.disabled = false;
+    setStatus("error", "No permission");
+    showOverlay("Camera / mic blocked",
+      "Allow access in your browser's site settings, then press Start again." +
+      (e && e.name ? "<br><small>" + e.name + "</small>" : ""), false);
+    return;
+  }
+  S.media = stream;
+  els.webcam.srcObject = stream;
+  try { await els.webcam.play(); } catch (e){}
+  els.pip.classList.add("on");
+  ensurePlayback();                       // created inside the click gesture
+  try { await startMic(stream); }
+  catch (e){
+    els.startBtn.disabled = false;
+    setStatus("error", "Audio failed");
+    showOverlay("Could not start audio capture", String((e && e.message) || e), false);
+    return;
+  }
+  S.running = true;
+  els.startBtn.disabled = false;
+  els.startBtn.classList.remove("primary");
+  els.startBtn.classList.add("stop");
+  els.startLbl.textContent = "Stop";
+  els.muteBtn.disabled = false;
+  lockSetup(true);                        // the handshake is sent once, at connect
+  S.camTimer = setInterval(grabFrame, Math.round(1000 / CAM_FPS));
+  connect();
+}
+
+function stopSession(){
+  S.running = false; S.closedByUser = true;
+  clearTimeout(S.retryTimer);
+  clearInterval(S.camTimer); S.camTimer = null;
+  if (S.ws){ try { S.ws.close(1000, "bye"); } catch (e){} S.ws = null; }
+  if (S.micNode){ try { S.micNode.disconnect(); } catch (e){} S.micNode = null; }
+  if (S.micCtx){ S.micCtx.close().catch(()=>{}); S.micCtx = null; }
+  if (S.media){ S.media.getTracks().forEach((t) => t.stop()); S.media = null; }
+  if (S.playCtx){ S.playCtx.close().catch(()=>{}); S.playCtx = null; S.gain = null; }
+  S.epoch = null; S.lastDrawnGi = -1;
+  for (const f of S.pendingFrames) if (f.bmp.close) f.bmp.close();
+  S.pendingFrames = [];
+  els.pip.classList.remove("on");
+  els.stage.classList.add("idle");
+  els.micBar.style.width = "0%";
+  els.startBtn.classList.remove("stop");
+  els.startBtn.classList.add("primary");
+  els.startLbl.textContent = "Start session";
+  els.muteBtn.disabled = true;
+  lockSetup(false);
+  S.sentPrompt = null; updatePromptNote();
+  setStatus("offline");
+  showOverlay("Session ended", "Press <strong>Start session</strong> to go live again.", false);
+  if (S.sessionStarted) systemLine("Session ended");
+  S.sessionStarted = 0;
+}
+
+function toggleMute(){
+  if (!S.media) return;
+  S.muted = !S.muted;
+  S.media.getAudioTracks().forEach((t) => { t.enabled = !S.muted; });
+  els.muteBtn.setAttribute("aria-pressed", String(S.muted));
+  els.stagebar.classList.toggle("muted", S.muted);
+  els.pipTag.textContent = S.muted ? "muted" : "webcam";
+  if (S.muted) els.micBar.style.width = "0%";
+}
+
+els.startBtn.addEventListener("click", () => (S.running ? stopSession() : startSession()));
+els.muteBtn.addEventListener("click", toggleMute);
+document.addEventListener("keydown", (e) => {
+  if (e.target && /^(INPUT|TEXTAREA)$/.test(e.target.tagName)) return;
+  if (e.key === "m" || e.key === "M"){ if (S.running) toggleMute(); }
+  else if (e.code === "Space"){ e.preventDefault(); S.running ? stopSession() : startSession(); }
+});
+window.addEventListener("beforeunload", () => { if (S.running) stopSession(); });
+
+/* ------------------------------------------------------------ diagnostics -- */
+setInterval(() => {
+  els.dFps.textContent = S.framesDrawn; S.framesDrawn = 0;
+  els.dUp.textContent = (S.bytesUp / 1024).toFixed(0); S.bytesUp = 0;
+  els.dDown.textContent = (S.bytesDown / 1024).toFixed(0); S.bytesDown = 0;
+  if (S.sessionStarted){
+    const s = Math.floor((Date.now() - S.sessionStarted) / 1000);
+    els.clockLbl.textContent = String(Math.floor(s/60)).padStart(2,"0") + ":" +
+                               String(s % 60).padStart(2,"0");
+  } else els.clockLbl.textContent = "--:--";
+  if (S.ws && S.ws.readyState === 1) sendJSON({ type:"ping", t:Date.now() });
+}, 1000);
+
+actx.fillStyle = "#e9e9e9";
+actx.fillRect(0, 0, els.avatar.width, els.avatar.height);
+setStatus("offline");
+updateClearState();   // derive it from the DOM, not just the markup's `disabled`
+</script>
+</body>
+</html>

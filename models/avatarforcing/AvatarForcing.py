@@ -1,3 +1,4 @@
+import os, time
 import torch, math
 import numpy as np
 import torch.nn as nn
@@ -16,6 +17,39 @@ from models.wav2vec2 import Wav2VecModel
 
 from models.avatarforcing.generator import Generator as MotionAutoencoder
 from models.avatarforcing.flow_transformer import FlowTransformer
+
+
+################ Optional timing instrumentation (env-gated, off by default) ################
+# Enable with AVATAR_TIMING=1. Adds torch.cuda.synchronize() around the hot spots, so it
+# perturbs the pipeline slightly — never leave it on in production.
+TIMING_ENABLED = os.environ.get("AVATAR_TIMING", "0") not in ("", "0", "false", "False", "no")
+TIMING_STATS = {}
+
+
+def _tic():
+    if not TIMING_ENABLED:
+        return None
+    torch.cuda.synchronize()
+    return time.perf_counter()
+
+
+def _toc(key: str, t0):
+    if t0 is None:
+        return
+    torch.cuda.synchronize()
+    TIMING_STATS.setdefault(key, []).append((time.perf_counter() - t0) * 1000.0)
+
+
+def timing_report(warmup: int = 1) -> str:
+    """Human-readable ms table. `warmup` per-block samples are dropped from the averages."""
+    if not TIMING_STATS:
+        return "(AVATAR_TIMING not enabled / no samples)"
+    lines = [f"{'stage':<34}{'n':>5}{'mean_ms':>10}{'min_ms':>9}{'max_ms':>9}"]
+    for key in sorted(TIMING_STATS):
+        vals = TIMING_STATS[key]
+        used = vals[warmup:] if len(vals) > warmup + 1 else vals
+        lines.append(f"{key:<34}{len(used):>5}{sum(used)/len(used):>10.1f}{min(used):>9.1f}{max(used):>9.1f}")
+    return "\n".join(lines)
 
 
 ################ Encoders ################
@@ -136,6 +170,7 @@ class AvatarForcing(BaseDiffusionModel):
         s_r_feats_expanded = [f.repeat_interleave(block_size, dim=0) for f in s_r_feats]
         
         for block_idx in range(0, T, block_size):
+            _t_dec = _tic()
             block_end = min(block_idx + block_size, T)
             block_len = block_end - block_idx
 
@@ -154,6 +189,7 @@ class AvatarForcing(BaseDiffusionModel):
             img_block = img_block.reshape(B, block_size, *img_block.shape[1:])
             
             if needs_padding: img_block = img_block[:, :block_len]
+            _toc("c) decode_latent_into_image / block", _t_dec)
             d_hat_blocks.append(img_block)
 
         d_hat = torch.cat(d_hat_blocks, dim=1).squeeze()
@@ -267,8 +303,10 @@ class AvatarForcing(BaseDiffusionModel):
         self.initialize_kv_cache(batch_size=B, dtype=avatar_a.dtype, device=self.rank)
 
         avatar_a, user_a = avatar_a.to(self.rank), user_a.to(self.rank)
+        _t = _tic()
         avatar_wa = self.audio_encoder.inference(avatar_a, seq_len=T)
-        user_wa  = self.audio_encoder.inference(user_a, seq_len=T) 
+        user_wa  = self.audio_encoder.inference(user_a, seq_len=T)
+        _toc("audio_encode(full utterance, x2)", _t)
 
         # Computing the first block
         avatar_wa_t = avatar_wa[:, :self.num_frames_for_clip]
@@ -279,8 +317,10 @@ class AvatarForcing(BaseDiffusionModel):
         if user_wa_t.shape[1] < self.num_frames_for_clip:
             user_wa_t = F.pad(user_wa_t, (0, 0, 0, self.num_frames_for_clip - user_wa_t.shape[1]), mode='replicate')
 
+        _t = _tic()
         user_r_d = self.encode_user_motion(user_frame)
-        
+        _toc("user_motion_encode(all frames)", _t)
+
         user_r_d_t = user_r_d[:, :self.num_frames_for_clip]
 
         if user_r_d_t.shape[1] < self.num_frames_for_clip:
@@ -292,6 +332,7 @@ class AvatarForcing(BaseDiffusionModel):
         samples = []
         start_pos = 0
 
+        _t_prime = _tic()
         for index, current_timestep in enumerate(self.denoising_step_list):
             is_final_step = (index == len(self.denoising_step_list) - 1)
             x_t = self.solve_cfg(
@@ -321,11 +362,13 @@ class AvatarForcing(BaseDiffusionModel):
                     start_pos         = start_pos
                 )
 
+        _toc("a) priming block denoise (50f)", _t_prime)
         samples.append(x_t)
 
         # Computing the subsequent blocks
         if T - self.num_frames_for_clip > 0:
             for t in range(self.num_frames_for_clip, T, self.num_frames_per_block):
+                _t_block = _tic()
                 start_pos = t - 2 if use_kv_cache else t - (self.num_frames_for_clip - self.num_frames_per_block)
 
                 ss_idx, ee_idx = t, t + self.num_frames_per_block
@@ -348,9 +391,12 @@ class AvatarForcing(BaseDiffusionModel):
                 noise_t = torch.randn(B, self.num_frames_per_block, self.opt.dim_w, device=self.rank)
                 x_t = torch.cat([offset_x_t, noise_t], dim=1)
 
+                _t_cond = _tic()
                 precomputed_c, precomputed_wr, precomputed_adaLN = self.prepare_cfg_condition(
                     avatar_wa_t, user_wa_t, user_r_d_t, r_s, seq_len = self.num_frames_per_block, context_len = 2)
+                _toc("b1) block prepare_cfg_condition", _t_cond)
 
+                _t_denoise = _tic()
                 for index, current_timestep in enumerate(self.denoising_step_list):
                     is_final_step = (index == len(self.denoising_step_list) - 1)
 
@@ -383,6 +429,8 @@ class AvatarForcing(BaseDiffusionModel):
                             start_pos         = start_pos
                         )
 
+                _toc("b2) block denoise loop (10f, nfe)", _t_denoise)
+                _toc("b3) block total (cond+denoise)", _t_block)
                 samples.append(x_t[:, -self.num_frames_per_block:])
         
         samples = torch.cat(samples, dim=1)[:, :T]

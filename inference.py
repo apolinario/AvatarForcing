@@ -1,4 +1,10 @@
-import os, copy, pickle, torch, yaml, random, json, cv2, torchvision, subprocess, argparse, uuid, datetime, tempfile, librosa, face_alignment
+import os, copy, pickle, torch, yaml, random, json, cv2, subprocess, argparse, uuid, datetime, tempfile, face_alignment
+
+# NOTE: `librosa` is NOT importable-for-audio in this env: librosa.core.audio needs numba,
+# and no numba release supports numpy >= 2.5 (numpy 2.5.1 is pinned here). We load/resample
+# audio with soundfile + soxr instead, which is what librosa would use under the hood anyway.
+import soundfile as sf
+import soxr
 
 import numpy as np
 import pandas as pd
@@ -9,6 +15,27 @@ import torch.multiprocessing as mp
 
 import albumentations as A
 import albumentations.pytorch.transforms as A_pytorch
+
+import av  # torchvision.io.write_video was removed in torchvision >= 0.26
+
+
+def write_video_av(path: str, frames_uint8: torch.Tensor, fps: int) -> str:
+    """Minimal replacement for the removed `torchvision.io.write_video`.
+
+    frames_uint8: uint8 tensor [T, H, W, 3] (RGB) on CPU.
+    """
+    frames = frames_uint8.numpy()
+    T, H, W, _ = frames.shape
+    container = av.open(path, mode="w")
+    stream = container.add_stream("libx264", rate=int(fps))
+    stream.width, stream.height, stream.pix_fmt = W, H, "yuv420p"
+    for frame in frames:
+        for packet in stream.encode(av.VideoFrame.from_ndarray(frame, format="rgb24")):
+            container.mux(packet)
+    for packet in stream.encode():
+        container.mux(packet)
+    container.close()
+    return path
 
 from tqdm import tqdm
 from pathlib import Path
@@ -34,9 +61,18 @@ class DataProcessor:
                 A.Normalize(mean=(0.5,0.5,0.5), std=(0.5,0.5,0.5)),
                 A_pytorch.ToTensorV2()])
 
+    def load_audio(self, path: str) -> np.ndarray:
+        """librosa.load(path, sr=self.sampling_rate, mono=True) replacement (soundfile + soxr)."""
+        speech_array, file_sr = sf.read(path, dtype='float32', always_2d=False)
+        if speech_array.ndim > 1:
+            speech_array = speech_array.mean(axis=1)
+        if file_sr != self.sampling_rate:
+            speech_array = soxr.resample(speech_array, file_sr, self.sampling_rate)
+        return np.ascontiguousarray(speech_array, dtype=np.float32)
+
     def default_aud_loader(self, path: str) -> torch.Tensor:
-        speech_array, sampling_rate = librosa.load(path, sr=self.sampling_rate)
-        return self.wav2vec_preprocessor(speech_array, sampling_rate=sampling_rate, return_tensors='pt').input_values[0]
+        speech_array = self.load_audio(path)
+        return self.wav2vec_preprocessor(speech_array, sampling_rate=self.sampling_rate, return_tensors='pt').input_values[0]
 
     def default_img_loader(self, path:str) -> np.ndarray:
         img = cv2.imread(path)
@@ -170,6 +206,12 @@ class InferenceAgent:
                 use_kv_cache  = True
             )['d_hat']
 
+        from models.avatarforcing.AvatarForcing import TIMING_ENABLED, timing_report
+        if TIMING_ENABLED:
+            print("\n===== AVATAR_TIMING (ms, first sample of each per-block stage dropped) =====")
+            print(timing_report())
+            print("===========================================================================\n")
+
         avatar_name = os.path.basename(avatar_ref_path).split(".")[0]
         res_video_path = os.path.join(self.opt.result_dir, f"{avatar_name}-seed{seed}-{uuid.uuid4().hex[:10]}.mp4")
         self.save_video(d_hat, res_video_path, avatar_audio_path)
@@ -180,7 +222,7 @@ class InferenceAgent:
             vid = vid_target_recon.permute(0, 2, 3, 1)
             vid = vid.detach().clamp(-1, 1).cpu()
             vid = ((vid - vid.min()) / (vid.max() - vid.min()) * 255).type('torch.ByteTensor')
-            torchvision.io.write_video(temp_filename, vid, fps=self.opt.fps)			
+            write_video_av(temp_filename, vid, fps=self.opt.fps)
             
             if audio_path is not None: # add audio to video
                 with open(os.devnull, 'wb') as f:
