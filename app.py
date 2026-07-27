@@ -103,8 +103,21 @@ if FETCH:                                   # AVATAR_FETCH_WEIGHTS=0 for mock / 
     ensure_weights()
 
 from server.conversation import DEFAULT_SYSTEM_PROMPT, ConversationBrain
+from server.cpu_asr import CPUTranscriber
 from server.engine import AvatarEngine, FaceCropper
 from server.web import build_app
+
+# --------------------------------------------------------------------------- #
+# CPU transcription child (POST /voice)
+#
+# Started HERE, before any model is built, for two reasons: the fork stays cheap,
+# and — the important one — transcription must never run in this process. A
+# transformers pipeline generating in the web process initialises CUDA (ZeroGPU
+# reports cuda as available here), which poisons every later @spaces.GPU fork
+# with "No CUDA GPUs are available". See server/cpu_asr.py.
+# --------------------------------------------------------------------------- #
+CPU_ASR_REPO = os.environ.get("WHISPER_CPU_REPO", "openai/whisper-small")
+_CPU_ASR = CPUTranscriber(CPU_ASR_REPO) if FETCH else None
 
 # --------------------------------------------------------------------------- #
 # module-scope weight load (ZeroGPU packing)
@@ -129,18 +142,121 @@ if FETCH:
     log.info("weights ready in %.1f s", time.perf_counter() - t0)
 
 
+# --------------------------------------------------------------------------- #
+# OmniVoice (TTS) + its Whisper pipe (STT), replacing ElevenLabs
+#
+# Built at module scope for the same reason as the avatar engine: ZeroGPU
+# intercepts the move to "cuda" here and packs the weights (~2.0 GB), so the
+# first @spaces.GPU entry restores them into VRAM instead of paying a cold load
+# out of the visitor's 90 s lease.
+#
+# There are deliberately TWO Whisper models, on different devices, because the
+# two transcription jobs have opposite constraints:
+#
+#   * LIVE STT runs once per user utterance and the reply waits on it, so it has
+#     to be fast -> large-v3-turbo on the GPU (~200-300 ms), packed with
+#     everything else. On the Space's 2 vCPU it would take *seconds*, which is
+#     not a conversation.
+#   * The UPLOADED VOICE CLIP is transcribed once, before any lease exists, only
+#     to condition the voice clone -> a small model on the CPU is plenty, and
+#     running it here means the visitor spends no GPU quota to see the
+#     transcript of their own clip.
+# --------------------------------------------------------------------------- #
+TTS_REPO = os.environ.get("OMNIVOICE_REPO", "k2-fsa/OmniVoice")
+ASR_REPO = os.environ.get("WHISPER_REPO", "openai/whisper-large-v3-turbo")
+_ASR_MODEL = None
+_ASR_PROC = None
+_TTS = None
+
+if FETCH:
+    import torch as _torch
+    from omnivoice import OmniVoice
+
+    t0 = time.perf_counter()
+    log.info("building OmniVoice + packing weights for ZeroGPU")
+    # load_asr is deliberately NOT set here. Building an HF pipeline with
+    # device="cuda" in THIS process initialises a real CUDA context, which
+    # poisons the ZeroGPU fork -- every @spaces.GPU call then dies in
+    # worker_init with "No CUDA GPUs are available". The live ASR model is
+    # loaded inside the lease instead (server/speech.py).
+    _TTS = OmniVoice.from_pretrained(TTS_REPO, device_map="cuda:0",
+                                     dtype=_torch.float16)
+    log.info("OmniVoice ready in %.1f s", time.perf_counter() - t0)
+
+    # Live-STT weights, loaded and packed here rather than read from disk inside
+    # every lease. Only the weights: assembling the transformers *pipeline* is
+    # what initialises CUDA in this process and poisons the fork, so that part
+    # happens in the worker (server/speech.py).
+    from transformers import AutoProcessor, WhisperForConditionalGeneration
+
+    t0 = time.perf_counter()
+    _ASR_PROC = AutoProcessor.from_pretrained(ASR_REPO)
+    _ASR_MODEL = WhisperForConditionalGeneration.from_pretrained(
+        ASR_REPO, dtype=_torch.float16).to("cuda:0")
+    log.info("live ASR weights ready in %.1f s", time.perf_counter() - t0)
+
+
+# --------------------------------------------------------------------------- #
+# Pay AoTI's fixed start-up costs HERE, in the web process, so they do not come
+# out of the visitor's 90 s session.
+#
+#  * valid_vec_isa_list() compiles a small CPU probe to detect the vector ISA.
+#    spaces calls it from LazyAOTIModel.__init__, and it was the bulk of a
+#    23.7 s in-lease "AoTI load". It is CPU-only, so it is safe here, and the
+#    fork inherits the cached result.
+#  * the package itself is a couple of MB; fetching it now means the lease only
+#    maps it.
+# --------------------------------------------------------------------------- #
+AOTI_REPO = os.environ.get("OMNIVOICE_AOTI_REPO", "multimodalart/omnivoice-aoti")
+
+if FETCH and AOTI_REPO and _TTS is not None:
+    from server.speech import aoti_loader
+
+    t0 = time.perf_counter()
+    try:
+        # All of this is CPU work: download the package, compile the inductor
+        # vec-ISA probe, and bind the artifact to the module's parameter
+        # tensors. The binding holds REFERENCES to those tensors, and ZeroGPU's
+        # unpacking rebinds their .data to real VRAM in the worker -- so the
+        # weights the artifact sees are the restored ones, with nothing
+        # re-transferred. Doing it in the lease cost 23.7 s of the session.
+        spaces.aoti_load(_TTS, repo_id=AOTI_REPO, aoti_loader=aoti_loader)
+        log.info("AoTI package bound in %.1f s", time.perf_counter() - t0)
+    except Exception:
+        log.exception("AoTI bind failed -- synthesis will run eager")
+
+
+def speech_factory():
+    from server.speech import Speech
+
+    return Speech(_TTS, asr_model=_ASR_MODEL, asr_processor=_ASR_PROC)
+
+
 def brain_factory(on_event, cfg):
     """One brain per WS session, carrying that session's UI overrides.
 
-    ``cfg["voice_id"]`` falsy -> BrainConfig.resolved() falls back to the
-    VOICE_ID env; ``cfg["system_prompt"]`` falsy -> the built-in prompt.
+    The voice itself is no longer the brain's business: the clip is cloned into
+    the GPU worker by the web layer before priming, and the brain just asks it
+    to speak. ``cfg["system_prompt"]`` falsy -> the built-in prompt.
     """
     return ConversationBrain(
         on_event,
         use_vision=VISION,
-        voice_id=cfg.get("voice_id") or None,
         system_prompt=cfg.get("system_prompt") or DEFAULT_SYSTEM_PROMPT,
     )
+
+
+def voice_transcriber(audio_bytes: bytes) -> str:
+    """Whisper on the CPU for POST /voice — in a CHILD process, never here.
+
+    Runs without a GPU lease, so the visitor uploads a clip, sees its transcript
+    and only then starts a session, none of it billed to their quota. The child
+    is not an optimisation: torch inference in this process initialises CUDA and
+    breaks every later lease (server/cpu_asr.py).
+    """
+    if _CPU_ASR is None:
+        return ""
+    return _CPU_ASR.transcribe(audio_bytes)
 
 
 app = build_app(
@@ -149,6 +265,8 @@ app = build_app(
     engine_factory=lambda: _ENGINE,
     brain_factory=brain_factory,
     face_cropper_factory=lambda: FaceCropper(device=DEVICE),
+    speech_factory=speech_factory,
+    voice_transcriber=voice_transcriber,
     default_system_prompt=DEFAULT_SYSTEM_PROMPT,
 )
 

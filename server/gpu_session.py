@@ -29,11 +29,19 @@ webcam JPEG in and ~200 KB of encoded frames out — about 1.5% of that.
 
 Threading
 ---------
-The worker runs two dispatch lanes, mirroring the dedicated Space's two
-executors: ``push_frame`` on a crop lane, everything else on an engine lane, so
-a crop never queues behind a 400 ms ``step()``. Both submit to the same CUDA
-context, exactly as the original's two threads did. Threads only — a
-``@spaces.GPU`` fork is daemonic and cannot spawn child processes.
+The worker runs three interchangeable dispatch lanes so that the three kinds of
+work in flight — a 400 ms ``step()``, a ~20 ms crop, and a ~740 ms speech
+synthesis — never head-of-line block each other in the queue. They still
+serialise on the GPU; the lanes only stop a long job from delaying the dispatch
+of a short one. Threads only — a ``@spaces.GPU`` fork is daemonic and cannot
+spawn child processes.
+
+Speech
+------
+The worker also hosts OmniVoice TTS and Whisper STT (``server/speech.py``),
+which replaced ElevenLabs. That moves speech from a network call in the web
+process onto the same leased GPU as the avatar engine, so the two now share a
+budget — see ``server/speech.py`` for the arithmetic.
 """
 
 from __future__ import annotations
@@ -61,8 +69,10 @@ log = logging.getLogger("avatar.gpu")
 # warm-up silently eats a chunk of the session (measured: 11 s cold / 4 s warm,
 # i.e. a "90 s" lease delivering 76 s of talking).
 SESSION_SECONDS = int(os.environ.get("AVATAR_SESSION_SECONDS", "90"))
-# Headroom reserved for that warm-up when asking ZeroGPU for the lease.
-WARM_ALLOWANCE = float(os.environ.get("AVATAR_WARM_ALLOWANCE", "15.0"))
+# Headroom reserved for that warm-up when asking ZeroGPU for the lease. Covers
+# the engine warm (4-13 s) plus loading the live ASR model, which has to happen
+# in here rather than at import -- see server/speech.py.
+WARM_ALLOWANCE = float(os.environ.get("AVATAR_WARM_ALLOWANCE", "25.0"))
 # Stop serving this many seconds before the lease actually lapses, so the worker
 # tears down cleanly instead of being killed mid-step.
 LEASE_MARGIN = float(os.environ.get("AVATAR_LEASE_MARGIN", "3.0"))
@@ -101,14 +111,17 @@ _LEASE_GONE = "__lease_gone__"     # distinguishes "worker vanished" from "call 
 LANE_ENGINE = "engine"
 LANE_CROP = "crop"
 
-# Which lease the parent is currently talking to. Bumped by GPUProxy.open()
-# *before* the @spaces.GPU call forks, so the worker inherits the value and can
-# tell its own traffic from a previous session's.
+# Which lease the parent is talking to. Bumped by GPUProxy.open() and passed to
+# the worker as a CALL ARGUMENT -- deliberately not left to fork inheritance.
 #
-# Without this, a session that ends when its lease expires can leave a `step`
-# in flight; the next lease picks it up and runs it against an engine that was
-# never primed ("call start_session() before step()"), killing a fresh session
-# with the previous one's garbage. Observed in production, not hypothetical.
+# ZeroGPU reuses worker processes ("engine warm in 0.0s" on a second lease gives
+# it away), and a reused worker still holds the LEASE_ID from whenever it was
+# first forked. Relying on inheritance therefore made the worker reject every
+# request from the new lease, and the session hung with 0 frames cropped.
+#
+# The id exists because a session ending on lease expiry can leave a `step` in
+# flight; without it the next lease runs that stale call against an engine that
+# was never primed ("call start_session() before step()").
 LEASE_ID = 0
 
 
@@ -116,11 +129,14 @@ LEASE_ID = 0
 # worker side (runs inside the fork, with a real GPU)
 # =========================================================================== #
 class _Worker:
-    """Owns the engine, the cropper, the cropped-frame ring and JPEG encoding."""
+    """Owns the engine, the cropper, the frame ring, JPEG encoding and speech."""
 
-    def __init__(self, engine, cropper) -> None:
+    def __init__(self, engine, cropper, speech=None) -> None:
         self.engine = engine
         self.cropper = cropper
+        # OmniVoice TTS + Whisper STT. Shares the GPU with the avatar engine;
+        # see server/speech.py for the budget this has to fit in.
+        self.speech = speech
         self.frames: list[np.ndarray] = []
         self.first_frame: np.ndarray | None = None
         self.n_cropped = 0
@@ -222,6 +238,20 @@ class _Worker:
             self.cropper.reset()
         return {}
 
+    # -- speech RPC ------------------------------------------------------- #
+    # Phrase-at-a-time rather than one call per utterance: OmniVoice cannot
+    # stream below chunk granularity, so the phrase IS the streaming unit, and
+    # a short phrase also keeps each GPU burst small enough for the avatar
+    # engine's per-block budget.
+    def tts_set_voice(self, ref_bytes, ref_text, key) -> dict:
+        return self.speech.set_voice(ref_bytes, ref_text, key)
+
+    def tts_synth(self, text: str) -> dict:
+        return self.speech.synth(text)
+
+    def stt_transcribe(self, pcm: bytes, sr: int) -> dict:
+        return self.speech.transcribe(pcm, sr)
+
     def stats(self) -> dict:
         return {
             "pose_dist": float(getattr(self.engine, "pose_dist", 0.0)),
@@ -231,15 +261,17 @@ class _Worker:
         }
 
 
-def _serve(worker: _Worker, deadline: float, stop: threading.Event) -> None:
+def _serve(worker: _Worker, deadline: float, stop: threading.Event,
+           my_lease: int) -> None:
     """Pull work off ``REQ_Q`` and answer on ``RES_Q`` until stopped or expired.
 
     Lanes are interchangeable pullers, not routed queues: two of them run so a
     ~20 ms ``push_frame`` never waits behind a ~400 ms ``step``, which is the
     same overlap the dedicated Space got from its separate crop/GPU executors.
-    ``web.py`` keeps at most one crop and one step in flight, so two is enough.
+    ``web.py`` keeps at most one crop and one step in flight, and speech adds a
+    third, so three is enough. They still serialise on the GPU -- the point is
+    that a ~740 ms synthesis does not head-of-line block a 20 ms crop.
     """
-    my_lease = LEASE_ID
     while not stop.is_set():
         remaining = deadline - time.monotonic()
         if remaining <= 0:
@@ -257,6 +289,8 @@ def _serve(worker: _Worker, deadline: float, stop: threading.Event) -> None:
         if lease_id != my_lease:
             # A previous session's in-flight call. Answering it as a dead lease
             # lets that session finish dying instead of it corrupting this one.
+            log.info("dropping stale request %s from lease %s (serving %s)",
+                     method, lease_id, my_lease)
             RES_Q.put((seq, _LEASE_GONE, "that GPU session has ended"))
             continue
         try:
@@ -298,7 +332,8 @@ def _pin_cudnn_benchmark_off() -> None:
     torch.backends.cudnn.deterministic = True
 
 
-def gpu_worker_body(engine_factory, cropper_factory, lease_seconds: int):
+def gpu_worker_body(engine_factory, cropper_factory, lease_seconds: int,
+                    speech_factory=None, lease_id: int = 0):
     """The body of the lease. A generator so the caller can stream progress.
 
     Yields ``"__READY__"`` once the engine is warm, then a ``{"remaining": n}``
@@ -331,11 +366,27 @@ def gpu_worker_body(engine_factory, cropper_factory, lease_seconds: int):
     # The session clock starts HERE, so a cold warm-up costs the visitor slack
     # from WARM_ALLOWANCE rather than conversation time. Capped by the hard
     # deadline in case the warm-up overran that allowance.
-    deadline = min(time.monotonic() + SESSION_SECONDS, hard_deadline)
-    log.info("lease up: engine warm in %.1fs, %.0fs of session",
-             warm_s, deadline - time.monotonic())
+    log.info("engine warm in %.1fs", warm_s)
 
-    worker = _Worker(engine, cropper)
+    speech = None
+    if speech_factory is not None:
+        t_s = time.perf_counter()
+        try:
+            speech = speech_factory()
+            log.info("speech (OmniVoice + Whisper) ready in %.1fs",
+                     time.perf_counter() - t_s)
+        except Exception:
+            log.exception("speech init failed -- the avatar will be mute")
+
+    # The session clock starts HERE -- after EVERYTHING that has to happen
+    # before the first block, speech included. Setting it before speech init
+    # handed the visitor 63 s of a 90 s session, because loading the AoTI
+    # package and the ASR model ran on their clock.
+    deadline = min(time.monotonic() + SESSION_SECONDS, hard_deadline)
+    log.info("lease up: warm %.1fs total, %.0fs of session",
+             time.monotonic() - t_lease_start, deadline - time.monotonic())
+
+    worker = _Worker(engine, cropper, speech)
 
     # Drain anything a previous, aborted session left behind, so this lease does
     # not answer a stale request with a fresh sequence number.
@@ -346,9 +397,10 @@ def gpu_worker_body(engine_factory, cropper_factory, lease_seconds: int):
             break
 
     stop = threading.Event()
-    lanes = [threading.Thread(target=_serve, args=(worker, deadline, stop),
+    lanes = [threading.Thread(target=_serve,
+                              args=(worker, deadline, stop, lease_id),
                               name=f"gpu-lane-{i}", daemon=True)
-             for i in range(2)]
+             for i in range(3)]
     for t in lanes:
         t.start()
 
@@ -468,9 +520,14 @@ class GPUProxy:
         finally:
             with self._cv:
                 self._pending.pop(seq, None)
-        if ok is _LEASE_GONE:       # close() woke us, the worker is not coming back
+        # `==`, not `is`: the sentinel crosses a pickle boundary coming back
+        # from the worker, so the parent unpickles a DIFFERENT string object.
+        # With `is` this test never fired, the truthy sentinel slipped past the
+        # `not ok` check, and a rejected call returned its error message as if
+        # it were a result -- which then hung the session instead of failing it.
+        if ok == _LEASE_GONE:       # worker is gone, or refused a stale lease
             raise LeaseError(str(payload))
-        if not ok:                  # the worker ran the call and it raised
+        if ok is not True:          # the worker ran the call and it raised
             raise RuntimeError(str(payload))
         return payload
 
@@ -494,6 +551,21 @@ class GPUProxy:
 
     def reset_cropper(self) -> None:
         self.call("reset_cropper", lane=LANE_CROP, timeout=30.0)
+
+    # -- speech ------------------------------------------------------------ #
+    # These run on the crop lane, not the engine lane: the engine lane is the
+    # 400 ms block loop, and queueing a ~740 ms synthesis behind (or in front
+    # of) a step would stall video for a whole block. The two lanes are
+    # interchangeable pullers, so this just means "not behind the steps".
+    def tts_set_voice(self, ref_bytes, ref_text, key="") -> dict:
+        return self.call("tts_set_voice", ref_bytes, ref_text, key,
+                         lane=LANE_CROP, timeout=120.0)
+
+    def tts_synth(self, text: str) -> dict:
+        return self.call("tts_synth", text, lane=LANE_CROP, timeout=60.0)
+
+    def stt_transcribe(self, pcm: bytes, sr: int = 16000) -> dict:
+        return self.call("stt_transcribe", pcm, sr, lane=LANE_CROP, timeout=60.0)
 
     def stats(self) -> dict:
         try:

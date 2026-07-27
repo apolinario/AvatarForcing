@@ -11,11 +11,10 @@
 # pip resolve against download.pytorch.org and fight the preinstalled runtime.
 torch==2.11.0
 torchvision==0.26.0         # must match torch 2.11; models/avatarforcing uses torchvision.transforms.functional
-# torchaudio is NOT needed: nothing imports it (audio I/O is soundfile + soxr).
+torchaudio==2.11.0          # required by omnivoice (must match torch)
 
 # --- AvatarForcing model code (server/engine.py imports models.* directly) -- #
-transformers>=5.0,<6        # Wav2Vec2Model/Config/FeatureExtractor + modeling_outputs only;
-                            # models/wav2vec2.py is already patched for the v5 output_attentions check
+transformers>=5.3,<6        # >=5.3 is omnivoice's floor; avatar wav2vec2.py is patched for v5
 timm>=1.0.9,<2              # timm.layers.use_fused_attn + models.vision_transformer.Mlp
 omegaconf>=2.3.0
 opencv-python>=4.10         # resize/cvtColor/imread/INTER_AREA only — API stable across 4.x and 5.x
@@ -31,8 +30,9 @@ soxr>=0.5
 av>=12.0                    # torchvision.io.write_video is gone in torchvision >= 0.26
 albumentations>=2.0.8
 pandas>=2.2
-# librosa deliberately omitted: librosa.core.audio needs numba, no numba release
-# supports the numpy this env resolves to; inference.py uses soundfile+soxr instead.
+# librosa is now pulled in by omnivoice and resolves fine: numba 0.66 supports
+# numpy 2.4, so the old "no numba release supports this numpy" note is stale.
+# inference.py still uses soundfile+soxr and does not import it.
 # matplotlib deliberately omitted: it is in AvatarForcing/requirements.txt but nothing imports it.
 
 # --- server ---------------------------------------------------------------- #
@@ -44,7 +44,12 @@ uvicorn>=0.30
 websockets>=13.0            # server/conversation.py uses websockets.asyncio.client
 python-dotenv>=1.0          # optional .env load in server/conversation.py
 openai>=1.40                # AsyncOpenAI against the HF router (chat.completions)
-elevenlabs>=2.20            # elevenlabs.realtime {AudioFormat, CommitStrategy, RealtimeEvents}
+
+# --- speech: OmniVoice TTS + Whisper STT, replacing ElevenLabs -------------- #
+# Pulls librosa/numba/pydub/webdataset/tensorboardX and an unpinned gradio; all
+# verified to resolve against the pins above (and gradio stays platform-managed
+# at the README's 6.20.0) on multimodalart/omnivoice-bench-zerogpu.
+omnivoice==0.2.1
 
 # --- cold-start weight download (app.py: ensure_weights) ------------------- #
 # checkpoints come from the Hub mirror multimodalart/AvatarForcingHelpers (the

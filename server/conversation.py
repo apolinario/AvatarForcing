@@ -4,12 +4,10 @@ Pipeline
 --------
     mic PCM (int16 @16 kHz)
         -> energy VAD (barge-in detection + fallback segmentation)
-        -> ElevenLabs Scribe realtime STT websocket   (transport A, default)
-           or ElevenLabs batch STT per VAD utterance  (transport B, fallback)
+        -> Whisper STT, one shot per VAD-delimited utterance   (on the GPU)
         -> final transcript
         -> LLM (HF router, OpenAI-compatible, streaming, vision: webcam snapshot)
-        -> ElevenLabs TTS websocket "stream-input"    (transport A, default)
-           or HTTP streaming TTS per sentence         (transport B, fallback)
+        -> OmniVoice TTS, one synthesis per phrase             (on the GPU)
         -> int16 16 kHz PCM appended to the avatar-audio buffer
         -> pull_avatar_audio() (consumed by the web layer / AvatarForcing engine)
 
@@ -73,9 +71,9 @@ class BrainConfig:
     """All tunable knobs. Override per-instance via ``ConversationBrain(..., **kwargs)``."""
 
     # --- credentials / endpoints (read from .env when None) ---
-    eleven_api_key: t.Optional[str] = None      # ELEVEN_TOKEN
+    # Only the LLM is remote now: speech runs locally on the leased GPU, so
+    # there is no TTS/STT vendor key any more.
     hf_token: t.Optional[str] = None            # HF_TOKEN
-    voice_id: t.Optional[str] = None            # VOICE_ID
     env_path: str = "/home/user/app/.env"
 
     # --- LLM ---
@@ -98,9 +96,9 @@ class BrainConfig:
     vision_disable_after_failures: int = 3
 
     # --- STT ---
-    stt_transport: str = "realtime"             # "realtime" | "batch" | "off"
-    stt_realtime_model: str = "scribe_v2_realtime"
-    stt_batch_model: str = "scribe_v1"
+    # Whisper is not a streaming recogniser, so utterances are transcribed in
+    # one shot at the VAD endpoint. "off" disables STT entirely.
+    stt_transport: str = "batch"                # "batch" | "off"
     stt_language: t.Optional[str] = "en"
     stt_vad_silence_secs: float = 0.6           # server-side VAD commit threshold
     stt_mute_while_speaking: bool = False       # drop mic audio while avatar talks (anti-echo)
@@ -111,14 +109,12 @@ class BrainConfig:
     turn_debounce_ms: int = 0
     stt_max_utterance_secs: float = 25.0        # batch mode hard cap
 
-    # --- TTS ---
-    tts_transport: str = "websocket"            # "websocket" | "http"
-    tts_model: str = "eleven_flash_v2_5"
-    tts_stability: float = 0.45
-    tts_similarity_boost: float = 0.8
-    tts_speed: t.Optional[float] = None
-    tts_auto_mode: bool = True
-    tts_min_chunk_chars: int = 40               # phrase buffering before a ws send
+    # --- TTS (OmniVoice on the leased GPU; see server/speech.py) ---
+    # The reference clip that defines the avatar's voice. Supplied per session
+    # by the client; falls back to the model's own default voice when absent.
+    ref_audio: t.Optional[bytes] = None
+    ref_text: t.Optional[str] = None
+    tts_min_chunk_chars: int = 40               # phrase buffering before synthesis
 
     # --- local energy VAD ---
     vad_frame_ms: int = 20
@@ -143,15 +139,7 @@ class BrainConfig:
             load_dotenv(self.env_path, override=False)
         return replace(
             self,
-            # Both spellings: the dedicated Space's secret is ELEVEN_TOKEN, the
-            # ZeroGPU one's is ELEVENLABS_API_KEY. Accepting either keeps one
-            # code path working against both Spaces' secret sets.
-            eleven_api_key=(self.eleven_api_key
-                            or os.environ.get("ELEVEN_TOKEN")
-                            or os.environ.get("ELEVENLABS_API_KEY")
-                            or ""),
             hf_token=self.hf_token or os.environ.get("HF_TOKEN") or "",
-            voice_id=self.voice_id or os.environ.get("VOICE_ID") or "",
         )
 
 
@@ -307,118 +295,109 @@ class PhraseChunker:
 
 
 # --------------------------------------------------------------------------- #
-# ElevenLabs streaming TTS over websocket "stream-input"
+# OmniVoice TTS, phrase at a time, on the leased GPU
 # --------------------------------------------------------------------------- #
-class _WebsocketTTS:
-    """One websocket per avatar turn. Opened eagerly so connect latency
-    overlaps the LLM's time-to-first-token."""
+class _OmniVoiceTTS:
+    """Phrase-at-a-time synthesis on the leased GPU, one instance per turn.
+
+    Keeps the interface the turn loop already used for the ElevenLabs websocket
+    (``open`` / ``send_text`` / ``finish`` / ``close`` / ``error``) so the loop
+    itself is unchanged: it still pushes phrases as the LLM emits them.
+
+    What changed underneath is the streaming granularity. A websocket streamed
+    audio continuously; OmniVoice is a masked diffusion LM that denoises a whole
+    fixed-length chunk at once, so the smallest unit it can emit is a phrase.
+    Phrases are synthesised **in order** by a single consumer task, because the
+    avatar audio buffer is a byte stream and two concurrent syntheses would
+    interleave into noise.
+
+    Each ``synth`` is a blocking RPC to the GPU worker, so it runs in a thread —
+    the brain's event loop must stay responsive to keep feeding the mic and
+    honouring barge-in.
+    """
 
     def __init__(self, cfg: BrainConfig, on_pcm: t.Callable[[bytes], None]):
         self.cfg = cfg
         self.on_pcm = on_pcm
-        self._ws = None
-        self._reader: t.Optional[asyncio.Task] = None
         self.final = asyncio.Event()
         self.first_audio_at: t.Optional[float] = None
         self.opened_at: t.Optional[float] = None
         self.total_samples = 0
         self.error: t.Optional[str] = None
-
-    def _url(self) -> str:
-        params = [
-            f"model_id={self.cfg.tts_model}",
-            "output_format=pcm_16000",
-            "inactivity_timeout=20",
-        ]
-        if self.cfg.tts_auto_mode:
-            params.append("auto_mode=true")
-        return (
-            f"wss://api.elevenlabs.io/v1/text-to-speech/{self.cfg.voice_id}"
-            f"/stream-input?" + "&".join(params)
-        )
+        self._q: asyncio.Queue = asyncio.Queue()
+        self._task: t.Optional[asyncio.Task] = None
+        self._closed = False
+        self.gpu_ms = 0.0
+        self.audio_secs = 0.0
 
     async def open(self) -> None:
-        from websockets.asyncio.client import connect as ws_connect
+        # Nothing to connect: the voice prompt was built once at session start.
+        # The consumer starts here so the first phrase is picked up the instant
+        # the LLM produces it.
+        self.opened_at = time.perf_counter()
+        self._task = asyncio.create_task(self._consume(), name="tts-consume")
 
-        t0 = time.monotonic()
-        self._ws = await ws_connect(
-            self._url(),
-            additional_headers={"xi-api-key": self.cfg.eleven_api_key},
-            max_queue=64,
-            open_timeout=10,
-        )
-        self.opened_at = time.monotonic()
-        log.debug("tts ws open in %.3fs", self.opened_at - t0)
-        vs: t.Dict[str, t.Any] = {
-            "stability": self.cfg.tts_stability,
-            "similarity_boost": self.cfg.tts_similarity_boost,
-        }
-        if self.cfg.tts_speed is not None:
-            vs["speed"] = self.cfg.tts_speed
-        init: t.Dict[str, t.Any] = {"text": " ", "voice_settings": vs}
-        if not self.cfg.tts_auto_mode:
-            init["generation_config"] = {"chunk_length_schedule": [50, 120, 200, 300]}
-        await self._ws.send(json.dumps(init))
-        self._reader = asyncio.create_task(self._read_loop())
+    async def _consume(self) -> None:
+        from server.gpu_session import PROXY, LeaseError
 
-    async def _read_loop(self) -> None:
         try:
-            async for raw in self._ws:  # type: ignore[union-attr]
-                try:
-                    msg = json.loads(raw)
-                except Exception:
-                    continue
-                audio = msg.get("audio")
-                if audio:
-                    pcm = base64.b64decode(audio)
-                    if pcm:
-                        if self.first_audio_at is None:
-                            self.first_audio_at = time.monotonic()
-                        self.total_samples += len(pcm) // _BYTES_PER_SAMPLE
-                        self.on_pcm(pcm)
-                if msg.get("error") or msg.get("message"):
-                    self.error = str(msg.get("error") or msg.get("message"))
-                    log.warning("tts ws message: %s", self.error)
-                if msg.get("isFinal"):
+            while True:
+                text = await self._q.get()
+                if text is None:          # finish() sentinel
                     break
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:  # connection dropped
-            self.error = f"{type(exc).__name__}: {exc}"
-            log.warning("tts ws read error: %s", self.error)
+                if self._closed:
+                    continue
+                try:
+                    res = await asyncio.to_thread(PROXY.tts_synth, text)
+                except LeaseError as exc:
+                    self.error = f"GPU session ended: {exc}"
+                    break
+                except Exception as exc:
+                    self.error = f"{type(exc).__name__}: {exc}"
+                    log.exception("tts synth failed")
+                    break
+                pcm = res.get("pcm") or b""
+                self.gpu_ms += float(res.get("ms", 0.0))
+                self.audio_secs += float(res.get("secs", 0.0))
+                if not pcm:
+                    continue
+                if self.first_audio_at is None:
+                    self.first_audio_at = time.perf_counter()
+                self.total_samples += len(pcm) // _BYTES_PER_SAMPLE
+                self.on_pcm(pcm)
         finally:
             self.final.set()
 
     async def send_text(self, text: str) -> None:
-        if self._ws is None or not text:
+        if self._closed or not text or not text.strip():
             return
-        await self._ws.send(json.dumps({"text": text, "try_trigger_generation": True}))
+        self._q.put_nowait(text)
 
-    async def finish(self, timeout: float = 30.0) -> None:
-        """Signal end of input and wait for the last audio chunk."""
-        if self._ws is not None:
-            try:
-                await self._ws.send(json.dumps({"text": ""}))
-            except Exception:
-                pass
+    async def finish(self, timeout: float = 60.0) -> None:
+        """Stop accepting phrases and wait for the queued ones to be spoken."""
+        self._q.put_nowait(None)
         try:
             await asyncio.wait_for(self.final.wait(), timeout=timeout)
         except asyncio.TimeoutError:
-            log.warning("tts ws finish timed out")
+            log.warning("tts finish timed out with %d phrases queued",
+                        self._q.qsize())
 
     async def close(self) -> None:
-        if self._reader is not None and not self._reader.done():
-            self._reader.cancel()
+        # Barge-in path: drop anything not yet synthesised rather than paying
+        # GPU time to speak a turn the user already interrupted.
+        self._closed = True
+        while not self._q.empty():
             try:
-                await self._reader
-            except (asyncio.CancelledError, Exception):
-                pass
-        if self._ws is not None:
-            try:
-                await self._ws.close()
+                self._q.get_nowait()
             except Exception:
-                pass
-            self._ws = None
+                break
+        if self._task is not None and not self._task.done():
+            self._q.put_nowait(None)
+            try:
+                await asyncio.wait_for(self._task, timeout=30.0)
+            except (asyncio.TimeoutError, asyncio.CancelledError, Exception):
+                self._task.cancel()
+        self.final.set()
 
 
 # --------------------------------------------------------------------------- #
@@ -479,13 +458,11 @@ class ConversationBrain:
         self._wake: t.Optional[t.Callable[[], None]] = None
 
         # --- STT transport state ---
-        self._stt_conn = None
         self._stt_task: t.Optional[asyncio.Task] = None
         self._stt_ready = False
         self._batch_buf = bytearray()
         self._batch_preroll = bytearray()
         self._batch_active = False
-        self._eleven = None  # AsyncElevenLabs
         self._llm = None  # AsyncOpenAI
         self._llm_model = self.cfg.llm_model
 
@@ -612,7 +589,7 @@ class ConversationBrain:
     def active_transports(self) -> t.Dict[str, t.Any]:
         return {
             "stt": self.cfg.stt_transport,
-            "tts": self.cfg.tts_transport,
+            "tts": "omnivoice",
             "llm_model": self._llm_model,
             "vision": self.vision_active,
         }
@@ -688,8 +665,6 @@ class ConversationBrain:
             self._init_clients()
         except Exception as exc:
             self._error(f"client init failed: {type(exc).__name__}: {exc}")
-        if self.cfg.stt_transport == "realtime":
-            self._stt_task = asyncio.create_task(self._stt_supervisor())
         self._state = "listening"
         self._emit({"type": "state", "value": "listening"})  # always announce the initial state
         self._ready.set()
@@ -699,17 +674,13 @@ class ConversationBrain:
             self._running = False
 
     def _init_clients(self) -> None:
-        from elevenlabs.client import AsyncElevenLabs
+        """Only the LLM is remote now — speech runs on the leased GPU."""
         from openai import AsyncOpenAI
 
-        if not self.cfg.eleven_api_key:
-            raise RuntimeError("ELEVEN_TOKEN missing")
         if not self.cfg.hf_token:
             raise RuntimeError("HF_TOKEN missing")
-        if not self.cfg.voice_id:
-            raise RuntimeError("VOICE_ID missing")
-        self._eleven = AsyncElevenLabs(api_key=self.cfg.eleven_api_key)
-        self._llm = AsyncOpenAI(base_url=self.cfg.llm_base_url, api_key=self.cfg.hf_token, timeout=60.0)
+        self._llm = AsyncOpenAI(base_url=self.cfg.llm_base_url,
+                                api_key=self.cfg.hf_token, timeout=60.0)
 
     async def _shutdown(self) -> None:
         self._running = False
@@ -721,7 +692,6 @@ class ConversationBrain:
             except (asyncio.CancelledError, Exception):
                 pass
             self._stt_task = None
-        await self._close_stt()
         if self._audio_evt is not None:
             self._audio_evt.set()
 
@@ -781,98 +751,6 @@ class ConversationBrain:
     # ------------------------------------------------------------------ #
     # STT transport A: Scribe realtime websocket
     # ------------------------------------------------------------------ #
-    async def _stt_supervisor(self) -> None:
-        """Keep the realtime STT websocket alive, reconnecting with backoff."""
-        delay = self.cfg.stt_reconnect_delay
-        while self._running:
-            try:
-                await self._open_stt()
-                delay = self.cfg.stt_reconnect_delay
-                while self._running and self._stt_ready:
-                    await asyncio.sleep(0.2)
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                self._error(f"STT connect failed: {type(exc).__name__}: {exc}")
-            self._stt_ready = False
-            await self._close_stt()
-            if not self._running:
-                break
-            await asyncio.sleep(delay)
-            delay = min(delay * 2, 10.0)
-
-    async def _open_stt(self) -> None:
-        from elevenlabs.realtime import AudioFormat, CommitStrategy, RealtimeEvents
-
-        opts: t.Dict[str, t.Any] = {
-            "model_id": self.cfg.stt_realtime_model,
-            "audio_format": AudioFormat.PCM_16000,
-            "sample_rate": SR,
-            "commit_strategy": CommitStrategy.VAD,
-            "vad_silence_threshold_secs": self.cfg.stt_vad_silence_secs,
-        }
-        if self.cfg.stt_language:
-            opts["language_code"] = self.cfg.stt_language
-        conn = await self._eleven.speech_to_text.realtime.connect(opts)  # type: ignore[union-attr]
-        self._stt_conn = conn
-        self._stt_ready = True
-
-        conn.on(RealtimeEvents.PARTIAL_TRANSCRIPT.value, self._on_stt_partial)
-        conn.on(RealtimeEvents.COMMITTED_TRANSCRIPT.value, self._on_stt_committed)
-        conn.on(RealtimeEvents.CLOSE.value, self._on_stt_close)
-        for ev in (
-            RealtimeEvents.AUTH_ERROR,
-            RealtimeEvents.QUOTA_EXCEEDED,
-            RealtimeEvents.TRANSCRIBER_ERROR,
-            RealtimeEvents.RATE_LIMITED,
-            RealtimeEvents.INPUT_ERROR,
-            RealtimeEvents.RESOURCE_EXHAUSTED,
-            RealtimeEvents.SESSION_TIME_LIMIT_EXCEEDED,
-            RealtimeEvents.UNACCEPTED_TERMS_ERROR,
-        ):
-            conn.on(ev.value, self._on_stt_error)
-        log.info("STT realtime websocket open (%s)", self.cfg.stt_realtime_model)
-
-    async def _close_stt(self) -> None:
-        conn, self._stt_conn = self._stt_conn, None
-        self._stt_ready = False
-        if conn is not None:
-            try:
-                await conn.close()
-            except Exception:
-                pass
-
-    async def _stt_feed_realtime(self, pcm: np.ndarray) -> None:
-        conn = self._stt_conn
-        if conn is None or not self._stt_ready:
-            return
-        try:
-            await conn.send({"audio_base_64": base64.b64encode(pcm.tobytes()).decode("ascii")})
-        except Exception as exc:
-            log.warning("STT send failed (%s), will reconnect", exc)
-            self._stt_ready = False
-
-    def _on_stt_partial(self, data: dict | None = None) -> None:
-        text = (data or {}).get("text") or ""
-        if text.strip():
-            self._emit({"type": "user_transcript", "text": text.strip(), "final": False})
-
-    def _on_stt_committed(self, data: dict | None = None) -> None:
-        text = (data or {}).get("text") or ""
-        self._on_final_transcript(text)
-
-    def _on_stt_close(self, *_: t.Any) -> None:
-        if self._running:
-            log.info("STT websocket closed")
-        self._stt_ready = False
-
-    def _on_stt_error(self, data: dict | None = None) -> None:
-        d = data or {}
-        msg = d.get("message") or d.get("error") or d.get("message_type") or "unknown STT error"
-        self._error(f"STT: {msg}")
-        if d.get("message_type") in ("auth_error", "session_time_limit_exceeded", "resource_exhausted"):
-            self._stt_ready = False
-
     # ------------------------------------------------------------------ #
     # STT transport B: batch endpoint per VAD-segmented utterance
     # ------------------------------------------------------------------ #
@@ -897,19 +775,27 @@ class ConversationBrain:
             del self._batch_preroll[: len(self._batch_preroll) - preroll_cap]
 
     async def _batch_transcribe(self, pcm_bytes: bytes) -> None:
+        """Transcribe one VAD-delimited utterance with Whisper on the leased GPU.
+
+        This replaced ElevenLabs Scribe. Batch-per-utterance rather than a
+        streaming recogniser: Whisper is not streaming, and the local VAD
+        already tells us where an utterance ends, so the added latency is one
+        transcription (~200-400 ms) after the user stops talking rather than a
+        continuously updating partial.
+        """
+        from server.gpu_session import PROXY, LeaseError
+
         if len(pcm_bytes) < int(0.25 * SR) * _BYTES_PER_SAMPLE:
             return
         try:
-            res = await self._eleven.speech_to_text.convert(  # type: ignore[union-attr]
-                model_id=self.cfg.stt_batch_model,
-                file=("utterance.pcm", pcm_bytes, "application/octet-stream"),
-                file_format="pcm_s16le_16",
-                language_code=self.cfg.stt_language,
-                tag_audio_events=False,
-            )
-            text = getattr(res, "text", None) or ""
+            res = await asyncio.to_thread(PROXY.stt_transcribe, pcm_bytes, SR)
+            text = (res or {}).get("text") or ""
+        except LeaseError:
+            # The GPU went away mid-utterance; the web layer is already tearing
+            # the session down, so stay quiet rather than surfacing a second error.
+            return
         except Exception as exc:
-            self._error(f"batch STT failed: {type(exc).__name__}: {exc}")
+            self._error(f"STT failed: {type(exc).__name__}: {exc}")
             return
         self._on_final_transcript(text)
 
@@ -1102,14 +988,10 @@ class ConversationBrain:
             self._tts_stream_done = False
             self._turn_consumed_at_start = self._consumed_samples
         spoken_parts: t.List[str] = []
-        tts: t.Optional[_WebsocketTTS] = None
-        use_ws = self.cfg.tts_transport == "websocket"
+        tts: t.Optional[_OmniVoiceTTS] = None
         try:
-            if use_ws:
-                tts = _WebsocketTTS(self.cfg, self._append_avatar_pcm)
-                open_task = asyncio.create_task(tts.open())
-            else:
-                open_task = None
+            tts = _OmniVoiceTTS(self.cfg, self._append_avatar_pcm)
+            open_task = asyncio.create_task(tts.open())
 
             chunker = PhraseChunker(self.cfg.tts_min_chunk_chars)
             first_token_at: t.Optional[float] = None
@@ -1131,32 +1013,22 @@ class ConversationBrain:
                     if not phrase or not _SPEAKABLE.search(phrase):
                         continue
                     spoken_parts.append(phrase)
-                    if use_ws:
-                        if open_task is not None:
-                            await open_task
-                            open_task = None
-                        assert tts is not None
-                        await tts.send_text(phrase + " ")
-                    else:
-                        await self._http_tts(phrase)
-            tail = clean_for_speech(chunker.flush())
-            if tail and _SPEAKABLE.search(tail):
-                spoken_parts.append(tail)
-                if use_ws:
                     if open_task is not None:
                         await open_task
                         open_task = None
-                    assert tts is not None
-                    await tts.send_text(tail + " ")
-                else:
-                    await self._http_tts(tail)
-
-            if use_ws:
+                    await tts.send_text(phrase + " ")
+            tail = clean_for_speech(chunker.flush())
+            if tail and _SPEAKABLE.search(tail):
+                spoken_parts.append(tail)
                 if open_task is not None:
                     await open_task
                     open_task = None
-                assert tts is not None
-                await tts.finish()
+                await tts.send_text(tail + " ")
+
+            if open_task is not None:
+                await open_task
+                open_task = None
+            await tts.finish()
             fa = self._turn_first_audio_at
             if fa is not None:
                 if first_token_at is not None:
@@ -1236,21 +1108,3 @@ class ConversationBrain:
             self._history.append({"role": "assistant", "content": avatar_text})
         if len(self._history) > self.cfg.history_max_messages * 2:
             self._history = self._history[-self.cfg.history_max_messages * 2:]
-
-    async def _http_tts(self, text: str) -> None:
-        """Fallback TTS: HTTP streaming endpoint, one request per phrase."""
-        try:
-            stream = self._eleven.text_to_speech.stream(  # type: ignore[union-attr]
-                self.cfg.voice_id,
-                text=text,
-                model_id=self.cfg.tts_model,
-                output_format="pcm_16000",
-            )
-            async for chunk in stream:
-                if chunk:
-                    self._append_avatar_pcm(chunk)
-        except Exception as exc:
-            self._error(f"HTTP TTS failed: {type(exc).__name__}: {exc}")
-
-
-__all__ = ["ConversationBrain", "BrainConfig", "EnergyVAD", "PhraseChunker", "clean_for_speech"]

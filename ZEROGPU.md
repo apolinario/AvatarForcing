@@ -60,6 +60,47 @@ back to the Space's shared IP quota.
 (`export_history` / `import_history`) and the next lease seeds a fresh brain with
 it. Only the LLM history travels — the TTS socket and the video rollout restart.
 
+## Speech runs on the lease too
+
+The original used ElevenLabs for both TTS and STT. This branch replaces both
+with models on the same leased GPU (`server/speech.py`), so the only remote
+service left is the LLM:
+
+* **TTS — [OmniVoice](https://huggingface.co/k2-fsa/OmniVoice)**, zero-shot voice
+  cloning. It is a masked diffusion LM: duration is predicted up front and a
+  fixed-length sequence is denoised over `num_step` passes, so there is no
+  token-level streaming to be had — the audio does not exist until the last
+  step. The streaming unit is therefore the **phrase**, which is what the turn
+  loop already emitted, so that loop is unchanged.
+* **STT — Whisper large-v3-turbo**, one shot per VAD-delimited utterance. Whisper
+  is not a streaming recogniser and the local VAD already marks the endpoint.
+* **The uploaded voice clip** is transcribed by a *small* Whisper on the CPU in a
+  **child process** (`server/cpu_asr.py`), before any lease exists — so it costs
+  no GPU quota and the transcript is visible and editable before starting. The
+  child is not an optimisation: running torch inference in the web process
+  initialises CUDA there and poisons the fork.
+
+With no uploaded clip, one voice is pinned per session by synthesising a seed
+line and cloning from it. OmniVoice invents a speaker per generation, so
+phrase-at-a-time synthesis would otherwise change voice mid-reply.
+
+### AoTI
+
+`OmniVoice.forward` is AoT-Inductor compiled (built by a separate Space, loaded
+with `spaces.aoti_load` from a model repo). Measured on the half-MIG at
+`num_step=32`: a ~3 s phrase drops **914 → 264 ms (3.5x)**, a 12 s one
+891 → 522 ms.
+
+Export specialises the sequence length to `8k-2` — the model pads its sequence to
+a multiple of its 8 audio codebooks, so the modulo is baked into the graph.
+Rather than compile per length, `PaddedAOTI` pads each call up to the next
+conforming length (at most 7 positions, masked out of attention both ways) and
+slices the real positions back.
+
+Everything with a fixed cost is bound at **import**, in the web process: the
+packed weights, the AoTI artifact, and the ASR weights. The lease should run the
+model, not fetch and assemble it.
+
 ## Measured
 
 On `size="large"` (half of an RTX PRO 6000 Blackwell, 48 GB):
@@ -70,8 +111,9 @@ On `size="large"` (half of an RTX PRO 6000 Blackwell, 48 GB):
 | incl. fork round-trip | 213–239 ms |
 | block budget | 400 ms |
 | late blocks / dropped frames | 0 / 0 over 221 blocks |
-| weights packed at import | 1.21 GB in 5.6 s |
-| in-lease warm-up | 4–13 s |
+| weights packed at import | 4.85 GB (engine + OmniVoice + Whisper) |
+| in-lease warm-up | ~7 s |
+| TTS phrase, eager → AoTI | 914 ms → 264 ms |
 
 Half the card runs at ~55% of the block budget, so `size="xlarge"` buys headroom
 that is already there at twice the quota cost.

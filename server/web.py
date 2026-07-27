@@ -6,6 +6,7 @@
     GET  /            -> static/index.html
     GET  /defaults    -> JSON {system_prompt, max_prompt_chars} for the UI editor
     GET  /healthz     -> JSON status (lease held? session busy?)
+    POST /voice       -> transcribe an uploaded voice clip (CPU, this process)
     API  /run_session -> holds the ZeroGPU lease, streams ready/tick/expired
     WS   /ws          -> the binary real-time protocol from DESIGN.md
 
@@ -19,6 +20,7 @@ WebSocket protocol (little-endian, first byte = tag)
   C->S 0x01  mic audio     : [tag u8][int16 PCM mono 16 kHz ...]   (~100 ms)
   C->S 0x02  webcam frame  : [tag u8][JPEG bytes]                  (~25 fps)
   C->S 0x03  reference img : [tag u8][encoded image bytes]         (once, see below)
+  C->S 0x04  reference voice: [tag u8][encoded audio bytes]         (once, see below)
   S->C 0x11  avatar audio  : [tag u8][block_idx u32][int16 PCM x 6400]
   S->C 0x12  avatar frame  : [tag u8][block_idx u32][frame_in_block u8][JPEG]
   both  JSON text          : control + ConversationBrain events, plus
@@ -30,9 +32,15 @@ Session handshake (per-session config, before priming)
 Right after ``{"type":"hello"}`` the client sends exactly one::
 
     C->S {"type":"session_config",
-          "voice_id": "<ElevenLabs id>" | "",   # "" -> the server's VOICE_ID env
           "system_prompt": "<LLM system prompt>" | "",   # "" -> the built-in one
-          "reference": true|false}              # true -> a 0x03 frame follows
+          "ref_text": "<transcript of the voice clip>" | "",
+          "reference": true|false,              # true -> a 0x03 frame follows
+          "voice": true|false}                  # true -> a 0x04 frame follows
+
+The voice clip clones the avatar's voice with OmniVoice. ``ref_text`` is its
+transcript: the client gets one from ``POST /voice`` at upload time, which runs
+Whisper on the CPU in this process. Supplying it here means the lease only pays
+for building the voice-clone prompt (~750 ms) rather than transcribing too.
 
 and, when ``reference`` is true, immediately follows it with one 0x03 binary
 frame carrying the raw upload (<= ``MAX_REF_BYTES``). Ordering is guaranteed by
@@ -45,7 +53,7 @@ can seed its editor with the real prompt rather than a blank box::
     S->C {"type":"hello","server":...,"fps":...,"system_prompt":"<default>"}
 
 Everything downstream is gated on that handshake: the brain is built *after* it
-(so ``voice_id`` / ``system_prompt`` reach ``brain_factory``) and
+(so ``system_prompt`` reaches ``brain_factory``), the voice clip is cloned, and
 ``engine.set_reference`` runs on the GPU thread *before* the session's
 ``start_session``, because the identity latents are engine-level state shared by
 every session. The server answers with ``{"type":"reference","ok":true|false}``
@@ -53,9 +61,9 @@ and restores the default reference when the session ends. A client that sends no
 ``session_config`` is not broken: after ``CONFIG_TIMEOUT`` the session proceeds
 on the server defaults.
 
-``voice_id`` and ``system_prompt`` are held in memory for the session only —
-never logged, never echoed back, never written to ``/healthz`` (which reports
-bools, not the values).
+The voice clip, its transcript and ``system_prompt`` are held in memory for the
+session only — never logged, never echoed back, never written to ``/healthz``
+(which reports bools, not the values).
 
 Concurrency model (one WS session at a time)
 -------------------------------------------
@@ -97,7 +105,7 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable
 
 import numpy as np
-from fastapi import WebSocket, WebSocketDisconnect
+from fastapi import Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, JSONResponse
 
 from server import gpu_session
@@ -109,6 +117,7 @@ log = logging.getLogger("avatar.web")
 TAG_MIC = 0x01
 TAG_CAM = 0x02
 TAG_REF = 0x03
+TAG_VOICE = 0x04
 TAG_AUDIO_BLOCK = 0x11
 TAG_VIDEO_FRAME = 0x12
 
@@ -150,9 +159,15 @@ SEND_QUEUE_MAX = 240            # ~9 blocks of video+audio; video dropped if ful
 # falling back to the server defaults. Our own client sends it in the same tick
 # as `hello`, so this only ever pays out for third-party / test clients.
 CONFIG_TIMEOUT = float(os.environ.get("AVATAR_CONFIG_TIMEOUT", "3.0"))
+# How long priming waits for the first cropped frame before declaring failure.
+# Generous: it covers camera start-up plus the first crop round trip.
+FIRST_FRAME_TIMEOUT = float(os.environ.get("AVATAR_FIRST_FRAME_TIMEOUT", "25.0"))
 # Upper bound on an uploaded reference image. index.html already re-encodes to
 # <=1024 px JPEG q0.9 (~200 KB); this is the guard against everything else.
 MAX_REF_BYTES = int(os.environ.get("AVATAR_MAX_REF_BYTES", str(8 * 1024 * 1024)))
+# Upper bound on the voice reference clip. OmniVoice trims above 20 s anyway, so
+# this only needs to stop someone posting an album.
+MAX_VOICE_BYTES = int(os.environ.get("AVATAR_MAX_VOICE_BYTES", str(16 * 1024 * 1024)))
 # Cap on a user-supplied system prompt. The prompt is prepended to every LLM
 # request, so an unbounded one would cost time-to-first-token on every turn;
 # 8 KB is ~25x the built-in prompt and still far under the model's context.
@@ -288,8 +303,8 @@ class _Session:
         # every attribute this class used to read off `engine` now arrives as an
         # RPC result instead.
         self.gpu = gpu
-        # Built by configurator(), not here: the client's voice_id has to reach
-        # brain_factory, and it only arrives with `session_config`.
+        # Built by configurator(), not here: the client's system_prompt has to
+        # reach brain_factory, and it only arrives with `session_config`.
         self.brain_factory = brain_factory
         self.brain: Any = None
         self.loop = asyncio.get_running_loop()
@@ -304,11 +319,19 @@ class _Session:
         self.lease_lost: str | None = None
 
         # per-session config handshake (see the protocol docstring)
-        self.session_cfg: dict[str, Any] = {}  # holds voice_id; never logged
+        self.session_cfg: dict[str, Any] = {}  # holds ref_text; never logged
         self.resume = False                    # continue the previous conversation
         self.resumed_messages = 0
         self.ref_bytes: bytes | None = None
-        self.config_ready = asyncio.Event()    # session_config (+ 0x03) received
+        self.voice_bytes: bytes | None = None
+        self.voice_applied = False
+        self.config_ready = asyncio.Event()    # session_config + announced frames
+        # session_config announces which binary frames follow. config_ready must
+        # wait for ALL of them: releasing on the first one lets configurator()
+        # read a frame that has not landed yet, which silently dropped the voice
+        # clip whenever a reference photo was sent too.
+        self._await_ref = False
+        self._await_voice = False
         self.configured = asyncio.Event()      # config applied; brain/primer may go
         self.ref_applied = False
 
@@ -409,7 +432,18 @@ class _Session:
                               "text": f"Image too large (max {MAX_REF_BYTES // (1024*1024)} MB)."})
             else:
                 self.ref_bytes = body or None
-            self.config_ready.set()
+            self._await_ref = False
+            self._maybe_config_ready()
+        elif tag == TAG_VOICE:
+            body = bytes(data[1:])
+            if len(body) > MAX_VOICE_BYTES:
+                log.warning("voice clip too large (%d bytes), ignored", len(body))
+                self.enqueue({"type": "voice", "ok": False,
+                              "text": f"Clip too large (max {MAX_VOICE_BYTES // (1024*1024)} MB)."})
+            else:
+                self.voice_bytes = body or None
+            self._await_voice = False
+            self._maybe_config_ready()
         elif tag == TAG_CAM:
             jpeg = bytes(data[1:])
             if not jpeg:
@@ -435,15 +469,22 @@ class _Session:
             log.info("client hello: %s", msg)
         elif t == "session_config":
             self.resume = bool(msg.get("resume"))
-            voice_id = str(msg.get("voice_id") or "").strip()
-            if voice_id:
-                self.session_cfg["voice_id"] = voice_id     # NOT logged
+            ref_text = str(msg.get("ref_text") or "").strip()[:MAX_PROMPT_CHARS]
+            if ref_text:
+                self.session_cfg["ref_text"] = ref_text     # NOT logged
             prompt = str(msg.get("system_prompt") or "").strip()[:MAX_PROMPT_CHARS]
             if prompt:
                 self.session_cfg["system_prompt"] = prompt  # NOT logged
-            # `reference: true` promises a 0x03 frame next; wait for it instead.
-            if not msg.get("reference"):
-                self.config_ready.set()
+            # `reference`/`voice` promise a 0x03 / 0x04 frame next; wait for
+            # whichever were announced rather than racing ahead of them.
+            self._await_ref = bool(msg.get("reference"))
+            self._await_voice = bool(msg.get("voice"))
+            self._maybe_config_ready()
+
+    def _maybe_config_ready(self) -> None:
+        """Release the configurator once every announced frame has landed."""
+        if not self._await_ref and not self._await_voice:
+            self.config_ready.set()
 
     def _maybe_snapshot(self, jpeg: bytes) -> None:
         now = time.monotonic()
@@ -648,6 +689,18 @@ class _Session:
                 secs = await self.loop.run_in_executor(
                     _GPU_EXECUTOR, self.gpu.set_reference, None)
                 log.info("restored default reference in %.0f ms", secs * 1000.0)
+            # The voice prompt is engine-level state too, and building it costs
+            # ~750 ms, so it is paid here (while the client is still opening its
+            # camera) rather than on the first phrase of the first reply.
+            if self.voice_bytes is not None:
+                res = await self.loop.run_in_executor(
+                    _GPU_EXECUTOR, self.gpu.tts_set_voice, self.voice_bytes,
+                    self.session_cfg.get("ref_text"), "session")
+                self.voice_applied = bool(res.get("cloned"))
+                log.info("voice clone applied (%.0f KB) in %.0f ms",
+                         len(self.voice_bytes) / 1024.0,
+                         float(res.get("seconds", 0.0)) * 1000.0)
+                self.enqueue({"type": "voice", "ok": True})
         except LeaseError as exc:
             self._on_lease_lost(exc)
         except Exception as exc:
@@ -710,8 +763,20 @@ class _Session:
     async def primer(self) -> None:
         """Wait for the first webcam frame, prime the engine, announce ready."""
         await self.configured.wait()        # the reference must be swapped first
+        # Bounded: if cropping never lands a frame the client would otherwise sit
+        # on "Priming the model with your first frame..." forever, with no clue
+        # why. Say so instead.
+        t_wait = time.monotonic()
         while not self.have_first_frame:
             if self.closing.is_set():
+                return
+            if time.monotonic() - t_wait > FIRST_FRAME_TIMEOUT:
+                log.error("no cropped frame after %.0fs (%d received, %d cropped)",
+                          FIRST_FRAME_TIMEOUT, self.n_cam_frames, self.n_cropped)
+                self.enqueue({"type": "error", "code": "no_frames",
+                              "text": "The GPU worker never returned a cropped "
+                                      "frame. Try starting a new session."})
+                self.closing.set()
                 return
             await asyncio.sleep(0.02)
         log.info("priming engine with the worker's first cropped frame")
@@ -752,7 +817,7 @@ class _Session:
             "lease_lost": self.lease_lost,
             # booleans only: the values themselves never leave the session
             "custom_reference": self.ref_applied,
-            "custom_voice": "voice_id" in self.session_cfg,
+            "custom_voice": self.voice_applied,
             "custom_prompt": "system_prompt" in self.session_cfg,
             "resumed_messages": self.resumed_messages,
         }
@@ -765,6 +830,8 @@ def build_app(
     engine_factory: Callable[[], Any],
     brain_factory: Callable[[Callable[[dict], None], dict], Any],
     face_cropper_factory: Callable[[], Any] | None = None,
+    speech_factory: Callable[[], Any] | None = None,
+    voice_transcriber: Callable[[bytes], str] | None = None,
     *,
     static_dir: str | None = None,
     preload: bool = True,
@@ -779,10 +846,15 @@ def build_app(
                             handed to the GPU worker and called inside the lease.
     brain_factory         : (on_event, session_cfg) -> ConversationBrain-like.
                             ``session_cfg`` is the client's per-session config
-                            dict; today only ``{"voice_id": str}`` when the user
-                            supplied one (absent = use the server default).
+                            dict; today ``{"system_prompt": str, "ref_text": str}``
+                            when the user supplied them.
     face_cropper_factory  : () -> FaceCropper-like (``crop``); optional. Also
                             constructed inside the lease — it touches CUDA.
+    speech_factory        : () -> server.speech.Speech-like (``set_voice``,
+                            ``synth``, ``transcribe``); optional. Built inside
+                            the lease for the same reason.
+    voice_transcriber     : (audio bytes) -> transcript. Runs in THIS process on
+                            the CPU, serving ``POST /voice`` at upload time.
     static_dir            : directory holding ``index.html`` (default ``../static``)
     preload               : unused on ZeroGPU (kept for signature compatibility);
                             there is nothing to preload without a GPU.
@@ -807,9 +879,13 @@ def build_app(
     # X-IP-Token, so the GPU seconds are billed to whoever is watching instead
     # of falling back to the Space's shared IP quota.
     @spaces.GPU(duration=gpu_session.LEASE_SECONDS, size=gpu_session.GPU_SIZE)
-    def _hold_lease():
+    def _hold_lease(lease_id: int):
+        # lease_id is passed IN (pickled to the worker) rather than read from
+        # the module global there: ZeroGPU reuses worker processes, and a reused
+        # one holds a stale global.
         yield from gpu_session.gpu_worker_body(
-            engine_factory, face_cropper_factory, gpu_session.LEASE_SECONDS)
+            engine_factory, face_cropper_factory, gpu_session.LEASE_SECONDS,
+            speech_factory=speech_factory, lease_id=lease_id)
 
     @app.api(name="run_session")
     def run_session() -> str:
@@ -825,7 +901,7 @@ def build_app(
         state["lease"] = True
         gpu_session.PROXY.open()
         try:
-            for msg in _hold_lease():
+            for msg in _hold_lease(gpu_session.PROXY.lease_id):
                 if msg.get("event") == "ready":
                     holder.on_ready(msg.get("warm_seconds", 0.0),
                                     msg.get("session_seconds", 0.0))
@@ -859,6 +935,37 @@ def build_app(
             "system_prompt": default_system_prompt,
             "max_prompt_chars": MAX_PROMPT_CHARS,
         })
+
+    @app.post("/voice")
+    async def voice(request: Request) -> JSONResponse:
+        """Transcribe an uploaded voice clip. Runs in THIS process, on the CPU.
+
+        Deliberately not on the GPU: it happens once, at upload time, before any
+        lease exists, so doing it here costs the visitor no GPU seconds and lets
+        the UI show the transcript before they start. The lease then only builds
+        the voice-clone prompt.
+        """
+        if voice_transcriber is None:
+            return JSONResponse({"ok": False, "text": "",
+                                 "error": "no transcriber configured"},
+                                status_code=503)
+        data = await request.body()
+        if not data or len(data) > MAX_VOICE_BYTES:
+            return JSONResponse({"ok": False, "text": "",
+                                 "error": "empty or oversized clip"},
+                                status_code=400)
+        try:
+            t0 = time.perf_counter()
+            text = await asyncio.get_running_loop().run_in_executor(
+                None, voice_transcriber, data)
+            log.info("voice clip transcribed on CPU in %.1fs (%d chars)",
+                     time.perf_counter() - t0, len(text or ""))
+            return JSONResponse({"ok": True, "text": text or ""})
+        except Exception as exc:
+            log.exception("voice transcription failed")
+            return JSONResponse({"ok": False, "text": "",
+                                 "error": f"{type(exc).__name__}: {exc}"},
+                                status_code=500)
 
     @app.get("/healthz")
     async def healthz() -> JSONResponse:

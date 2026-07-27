@@ -303,11 +303,18 @@
     </div>
   </div>
   <div class="field">
-    <label for="voiceInput">ElevenLabs voice</label>
+    <span class="lbl">Voice</span>
     <div class="row">
-      <input type="text" id="voiceInput" autocomplete="off" spellcheck="false"
-             placeholder="voice ID — leave empty for default" />
+      <input type="file" id="voiceInput" accept="audio/*" />
+      <button class="button" id="voiceBtn" type="button">Upload a clip</button>
+      <button class="button" id="voiceClear" type="button" hidden>Clear</button>
+      <span class="hint" id="voiceName">default voice</span>
     </div>
+    <!-- Transcribed on upload (CPU, no GPU quota) because OmniVoice clones the
+         voice from audio + its transcript. Editable: a wrong word in here
+         degrades the clone. -->
+    <input type="text" id="voiceText" autocomplete="off" spellcheck="false"
+           placeholder="transcript of the clip — filled in automatically" hidden />
   </div>
 </div>
 
@@ -424,7 +431,7 @@
 
    Session handshake, in this exact order on every (re)connect:
      {"type":"hello"}
-     -> {"type":"session_config", voice_id, system_prompt, reference}
+     -> {"type":"session_config", system_prompt, ref_text, reference, voice}
      -> 0x03 (only when reference is true).
    The server gates brain construction and engine priming on it, so the voice id,
    the system prompt and the uploaded face are all in force before the first
@@ -448,7 +455,8 @@ const els = {};
  "stage","avatar","overlay","ovTitle","ovText","ovIcon","pip","pipTag",
  "webcam","stagebar","micBar","clockLbl","startBtn","startLbl","muteBtn","transcript",
  "emptyState","turnCount","dBlocks","dFps","dBuf","dUnder","dUp","dDown","dMic","dRtt",
- "verLbl","refInput","refBtn","refThumb","refClear","refName","voiceInput",
+ "verLbl","refInput","refBtn","refThumb","refClear","refName",
+ "voiceInput","voiceBtn","voiceClear","voiceName","voiceText",
  "tabTranscript","tabPrompt","promptPane","promptBox","promptReset","promptNote","clearBtn"]
  .forEach((k) => els[k] = $(k));
 
@@ -464,6 +472,7 @@ const S = {
   state:"offline", camTimer:null, camBusy:false,
   curAvatarBubble:null, curPartial:null, turns:0, sessionStarted:0,
   refBytes:null, refURL:null,   // re-encoded reference upload (null = server default)
+  voiceBytes:null,              // uploaded voice clip (null = OmniVoice default voice)
   defaultPrompt:"", promptDirty:false, sentPrompt:null,
   leaseJob:null, leaseOver:false,   // the /run_session job holding the ZeroGPU worker
   resume:false,                     // carry the conversation into the next lease
@@ -582,6 +591,42 @@ function clearReference(){
   els.refClear.style.display = "none";
   els.refName.textContent = "default face";
 }
+/* ----- voice clip: upload, transcribe on the server's CPU, keep both ----- */
+function clearVoice(){
+  S.voiceBytes = null;
+  els.voiceInput.value = "";
+  els.voiceText.value = "";
+  els.voiceText.hidden = true;
+  els.voiceClear.hidden = true;
+  els.voiceName.textContent = "default voice";
+}
+els.voiceBtn.addEventListener("click", () => els.voiceInput.click());
+els.voiceClear.addEventListener("click", clearVoice);
+els.voiceInput.addEventListener("change", async () => {
+  const file = els.voiceInput.files && els.voiceInput.files[0];
+  if (!file) return;
+  const buf = new Uint8Array(await file.arrayBuffer());
+  S.voiceBytes = buf;
+  els.voiceClear.hidden = false;
+  els.voiceName.textContent = file.name.slice(0, 28) + " · transcribing…";
+  // POST /voice runs Whisper on the server's CPU, before any GPU lease exists,
+  // so seeing the transcript costs the visitor no quota. OmniVoice clones from
+  // audio + transcript, so a wrong word here degrades the clone — hence the
+  // editable box rather than a silent round trip.
+  try {
+    const r = await fetch(new URL("./voice", window.location.href),
+                          { method:"POST", body:buf });
+    const j = await r.json();
+    els.voiceText.hidden = false;
+    els.voiceText.value = (j && j.text) || "";
+    els.voiceName.textContent = file.name.slice(0, 28) +
+      (j && j.ok ? "" : " · transcription failed, type it in");
+  } catch (e){
+    els.voiceText.hidden = false;
+    els.voiceName.textContent = file.name.slice(0, 28) + " · type the transcript";
+  }
+});
+
 els.refBtn.addEventListener("click", () => els.refInput.click());
 els.refClear.addEventListener("click", clearReference);
 els.refInput.addEventListener("change", async () => {
@@ -604,7 +649,9 @@ els.refInput.addEventListener("change", async () => {
 function lockSetup(locked){
   els.refBtn.disabled = locked;
   els.refClear.disabled = locked;
-  els.voiceInput.disabled = locked;
+  els.voiceBtn.disabled = locked;
+  els.voiceClear.disabled = locked;
+  els.voiceText.disabled = locked;
 }
 
 /* =========================================================================
@@ -932,13 +979,15 @@ function connect(){
     // Must precede the first 0x02 frame: the server holds priming (and the
     // brain) until this handshake completes.
     sendJSON({ type:"session_config",
-               voice_id: els.voiceInput.value.trim(),
                system_prompt: promptOverride(),
                resume: !!S.resume,
-               reference: !!S.refBytes });
+               ref_text: (els.voiceText.value || "").trim(),
+               reference: !!S.refBytes,
+               voice: !!S.voiceBytes });
     S.sentPrompt = promptValue();
     updatePromptNote();
     if (S.refBytes) sendBin(0x03, S.refBytes);
+    if (S.voiceBytes) sendBin(0x04, S.voiceBytes);
     showOverlay("Waking the avatar", "Priming the model with your first frame…", true);
   };
   ws.onmessage = (ev) => {
