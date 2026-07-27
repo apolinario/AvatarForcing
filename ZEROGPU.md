@@ -127,6 +127,7 @@ Requesting the session length directly means a cold warm-up silently eats it.
 Note that a large `duration` may exceed a free-tier visitor's per-call cap; lower
 `AVATAR_SESSION_SECONDS` if you see `ZeroGPU illegal duration`.
 
-Secrets: `HF_TOKEN`, `ELEVEN_TOKEN` (or `ELEVENLABS_API_KEY`), `VOICE_ID`.
+Secrets: just `HF_TOKEN` — it is the only remote service left, for the LLM.
+`OMNIVOICE_AOTI_REPO` points at the compiled artifact (empty string runs eager).
 `requirements.txt` for a Space drops the `--extra-index-url`/`+cu128` tags and
 does not list `gradio`, `spaces` or `huggingface_hub` — all platform-managed.
