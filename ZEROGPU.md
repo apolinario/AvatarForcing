@@ -2,8 +2,9 @@
 
 This branch is the [`streaming`](../../tree/streaming) server adapted to
 [ZeroGPU](https://huggingface.co/docs/hub/spaces-zerogpu), where GPUs are
-allocated per request rather than held for the process lifetime. Read
-[STREAMING.md](./STREAMING.md) first — this only covers the delta.
+allocated per request rather than held for the process lifetime. Read the
+[`streaming` branch README](../../blob/streaming/README.md) first — this only
+covers the delta.
 
 ## Why it needs a delta at all
 

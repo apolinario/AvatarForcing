@@ -28,9 +28,10 @@ released model into a live two-way conversation: one 10-frame / 400 ms block per
 call instead of `inference.py`'s offline whole-utterance rollout. The model and
 checkpoints are unchanged.
 
-**See [STREAMING.md](./STREAMING.md).** Three upstream files carry small
-environment fixes (transformers 5.x, torchvision 0.26, numpy 2.5); they are
-listed there.
+**See the [`streaming` branch README](../../blob/streaming/README.md)** for the
+engine, and **[ZEROGPU.md](./ZEROGPU.md)** for what this branch changes. Three
+upstream files carry small environment fixes (transformers 5.x, torchvision
+0.26, numpy 2.5); they are listed on the streaming branch.
 
 ## Getting Started
 ### Requirements
