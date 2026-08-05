@@ -1,138 +1,147 @@
-# [CVPR 2026] Avatar Forcing: Real-Time Interactive Head Avatar Generation for Natural Conversation
-Official Pytorch Implementation of Avatar Forcing; Motion Latent Diffusion Forcing for Interactive Head Avatar Generation
+# Avatar Forcing — streaming server
 
-![preview](./assets/overview.png)
+> Upstream's paper README lives in [UPSTREAM.md](UPSTREAM.md).
 
-### [CVPR 2026] Avatar Forcing: Real-Time Interactive Head Avatar Generation for Natural Conversation
+A fork addition on top of [TaekyungKi/AvatarForcing](https://github.com/TaekyungKi/AvatarForcing):
+a real-time conversational server around the released model. Upstream ships
+`inference.py`, which is offline and whole-utterance — it encodes the entire
+avatar/user waveform, then rolls the whole sequence out in one pass. This adds
+an **incremental** engine that produces one 10-frame / 400 ms block per call and
+can run indefinitely, plus the WebSocket server and browser client that turn it
+into a two-way conversation.
 
-[Taekyung Ki<sup>1</sup>*](https://taekyungki.github.io), &nbsp; [Sangwon Jang<sup>1</sup>*](https://agwmon.github.io/), &nbsp; [Jaehyeong Jo<sup>1</sup>](https://harryjo97.github.io/), &nbsp; [Jaehong Yoon<sup>2</sup>](https://jaehong31.github.io/), &nbsp;[Sung Ju hwang<sup>1,3</sup>](http://www.sungjuhwang.com/) <br>
-<sup>1</sup>KAIST &nbsp; <sup>2</sup>NTU Singapore &nbsp; <sup>3</sup>DeepAuto.ai &nbsp; &nbsp; &nbsp; &nbsp; <sup>*</sup>Equal contribution
+Nothing about the model or the checkpoints changes. The rollout is upstream's,
+one block at a time.
 
-[![Project Page](https://img.shields.io/badge/Project-Page-green)](https://taekyungki.github.io/AvatarForcing/)
-[![Pape](https://img.shields.io/badge/arXiv-2601.00664-b31b1b?logo=arxiv)](https://arxiv.org/abs/2601.00664v2)
-[![YouTube](https://img.shields.io/badge/Watch-YouTube-red?logo=youtube)](https://www.youtube.com/watch?v=TARPGnJ8GW4)
-[![Hugging Face](https://img.shields.io/badge/Hugging-Face-yellow?logo=huggingface)](https://huggingface.co/papers/2601.00664)
+The conversation stack is fully local apart from the LLM: OmniVoice voice
+cloning for the avatar's speech (phrase-at-a-time), Whisper large-v3-turbo for
+listening, smart-turn-v3 for semantic end-of-turn (the avatar answers when you
+finish a thought, not after a fixed silence), speculative transcription
+(Whisper runs while the turn detector is still deciding), barge-in, and
+built-in avatars with cloned voices and personas.
 
-
-#### TL:DR: Interactive Head Avatar Generation Model via Diffusion Forcing toward Human-like Conversation
-
-## Abstract
-
-Talking head generation creates lifelike avatars from static portraits for virtual communication and content creation. However, current models do not yet convey the feeling of truly interactive communication, often generating one-way responses that lack emotional engagement. We identify two key challenges toward truly interactive avatars: generating motion in real-time under causal constraints and learning expressive, vibrant reactions without additional labeled data. To address these challenges, we propose Avatar Forcing, a new framework for interactive head avatar generation that models real-time user-avatar interactions through diffusion forcing. This design allows the avatar to process real-time multimodal inputs, including the user's audio and motion, with low latency for instant reactions to both verbal and non-verbal cues such as speech, nods, and laughter. Furthermore, we introduce a direct preference optimization method that leverages synthetic losing samples constructed by dropping user conditions, enabling label-free learning of expressive interaction. Experimental results demonstrate that our framework enables real-time interaction with low latency (approximately 500ms), achieving 6.8x speedup compared to the baseline, and produces reactive and expressive avatar motion, which is preferred over 80% against the baseline.
-
-
-## Real-time streaming server (this fork)
-
-This fork adds an incremental engine and a WebSocket server that turn the
-released model into a live two-way conversation: one 10-frame / 400 ms block per
-call instead of `inference.py`'s offline whole-utterance rollout. The model and
-checkpoints are unchanged.
-
-**See the [`streaming` branch README](../../blob/streaming/README.md)** for the
-engine, and **[ZEROGPU.md](./ZEROGPU.md)** for what this branch changes. Three
-upstream files carry small environment fixes (transformers 5.x, torchvision
-0.26, numpy 2.5); they are listed on the streaming branch.
-
-## Getting Started
-### Requirements
+## Quickstart (local GPU)
 
 ```bash
-# 1. Create Conda environment
-conda create -n avatarforcing python==3.10
-conda activate avatarforcing
-
-# 2. Install torch and requirements
-bash environment.sh
-
-# or manual installation
-pip install torch==2.0.1 torchvision==0.15.2 torchaudio==2.0.2 --index-url https://download.pytorch.org/whl/cu118
-pip install -r requirements.txt
+git clone -b streaming https://github.com/apolinario/AvatarForcing
+cd AvatarForcing
+pip install -r requirements-streaming.txt
+export HF_TOKEN=hf_...        # any OpenAI-compatible LLM endpoint works; the
+                              # default is the HF router (see server/conversation.py)
+python app.py                 # downloads checkpoints on first run, then serves :7860
 ```
 
-### Model checkpoints
+Open http://localhost:7860, allow camera and microphone, press Start.
+
+To run on Hugging Face (a paid dedicated-GPU Space): push this branch to a
+Space with `app_file: app.py`. For free ZeroGPU hosting use the
+[`streaming-zerogpu`](../../tree/streaming-zerogpu) branch, which is this
+server behind a per-conversation GPU lease.
+
+```
+browser ──webcam JPEG + mic PCM──▶  server/web.py  ──▶ server/engine.py ──▶ AvatarForcing
+        ◀──avatar JPEG + PCM─────                  ──▶ server/conversation.py ──▶ LLM + TTS
+```
+
+## What's here
+
+| File | What it does |
+|---|---|
+| `server/engine.py` | The incremental engine. Re-formulates `AvatarForcing.sample()` as `start_session()` + repeated `step()` over rolling audio/frame buffers. Also `FaceCropper` (SFD, EMA-smoothed box). |
+| `server/web.py` | `gradio.Server` app: the binary WebSocket A/V protocol, one session at a time, paced 400 ms block loop. |
+| `server/conversation.py` | The conversation brain: energy VAD, barge-in, an OpenAI-compatible LLM turn, streaming TTS. |
+| `static/index.html` | Self-contained browser client — capture, jitter buffer, transcript, reference-photo upload. |
+| `app.py` | Entry point. Fetches checkpoints, builds the engine, serves on `:7860`. |
+| `server/mock_*.py` | Engine/brain stand-ins, so the web layer can be exercised without a GPU. |
+
+## Changes to upstream files
+
+Three files are modified, all to bring the code up on a current environment —
+no behavioural change to the model:
+
+- **`models/wav2vec2.py`** — upstream sets `config.output_attentions = True` in
+  `forward()`. transformers >= 5 raises for that unless the attention
+  implementation is `eager`, and the maps are never consumed downstream (the
+  audio encoder only reads `hidden_states`), so the assignment is dropped.
+  `config.use_return_dict` → `config.return_dict` for the same reason.
+- **`inference.py`** — `librosa` → `soundfile` + `soxr` (librosa's audio module
+  needs numba, and no numba release supports the numpy this environment
+  resolves to), and a small `av`-based replacement for
+  `torchvision.io.write_video`, removed in torchvision >= 0.26.
+- **`models/avatarforcing/AvatarForcing.py`** — optional timing instrumentation
+  behind `AVATAR_TIMING=1`, off by default.
+
+## How the incremental engine maps onto `sample()`
+
+`sample()` does, for a T-frame utterance:
+
+1. encode the *entire* avatar/user waveforms and all user frames;
+2. block 0 (frames `[0, 50)`): fresh noise, `nfe-1` `solve_cfg` steps with
+   `use_kv_cache=False`, then one `update_kv_cache`;
+3. blocks `t = 50, 60, ...`: `x_t = cat(last 2 clean latents, randn(10))`,
+   conditions sliced `[t-2, t+10)`, `use_kv_cache=True`, `start_pos = t-2`.
+
+`start_session()` is step 2 with 2 s of silence and the first user frame
+repeated. `step()` is exactly one iteration of step 3 — the only change is that
+conditions come from rolling buffers instead of pre-computed full-utterance
+tensors. Every tensor-level call (`prepare_cfg_condition` / `solve_cfg` /
+`update_kv_cache` / `decode_block`) is upstream's, unmodified.
+
+Two things had to be fixed to make an unbounded session work:
+
+- **Rotary table.** `Attention` registers `freqs_cis` for `max_seq_len=1024`. In
+  KV-cache mode `start_pos` grows without bound and
+  `freqs_cis[start_pos:start_pos+12]` throws once `start_pos + 12 > 1024` — the
+  session died after ~41 s. The table is rebuilt once at a configurable size and
+  shared across layers; beyond that, cached keys are phase-rotated back
+  (`_maybe_rebase_rope`), which is exact because RoPE is a per-position phase.
+- **Rollout drift.** Sharpness decays over minutes of continuous rollout. A
+  latent **pose anchor** holds the generated pose near the reference setpoint
+  with a deadband relative to `|r_s|`. Measured sharpness as % of the first 20 s,
+  in 20 s windows over 240 s:
+
+  | mitigation | trace |
+  |---|---|
+  | none | 89 76 60 52 50 45 41 45 40 42 39 45 |
+  | re-prime every 40 s | 89 76 69 63 88 75 73 55 82 73 72 54 |
+  | pose anchor | 92 94 85 86 83 80 88 83 76 71 78 77 |
+
+  The re-prime row is a sawtooth by construction — it restarts the rollout from
+  the reference state, so the pose visibly snaps back. The anchor is the default;
+  re-priming is kept behind `AVATAR_REPRIME_SECS` as a fallback.
+
+## Running it
+
 ```bash
-# 3. Download Avatar Forcing model and Wav2Vec2 from HuggingFace
-bash download_weights.sh
-
-# or manually download the weights from Google Drive
-# https://drive.google.com/drive/folders/1rN52J2QXD8A-r2CZ8nDqFdwvZuPRmMsc?hl=ko
-
-# and wav2vec2.0-960h from HuggingFace
-# https://huggingface.co/facebook/wav2vec2-base-960h
+pip install -r requirements-streaming.txt
+export HF_TOKEN=...           # LLM endpoint
+export ELEVEN_TOKEN=...       # TTS
+export VOICE_ID=...
+python app.py                 # http://localhost:7860
 ```
 
-The checkpoints (`pretrained_dir`) should be organized as follows:
-```bash
-./pretrained_dir
-├── checkpoint_here
-├── flow_transformer.pth              # main DFoT model
-├── motion_autoencoder.pth            # motion AE model
-└── wav2vec2-base-960h/               # pretrained wav2vec2 model
-    ├── .gitattributes
-    ├── config.json
-    ├── feature_extractor_config.json
-    ├── model.safetensors
-    ├── preprocessor_config.json
-    ├── pytorch_model.bin
-    ├── README.md
-    ├── special_tokens_map.json
-    ├── tf_model.h5
-    ├── tokenizer_config.json
-    └── vocab.json
-```
+Checkpoints are fetched on first start. Upstream's `download_weights.sh` pulls
+them from Google Drive, which rate-limits; `app.py` uses a Hub mirror instead
+(`AVATAR_WEIGHTS_REPO`, default `multimodalart/AvatarForcingHelpers`) and also
+fetches `facebook/wav2vec2-base-960h`.
 
+Useful knobs: `AVATAR_DEVICE`, `AVATAR_LEAD_BLOCKS`, `AVATAR_JPEG_QUALITY`,
+`AVATAR_REPRIME_SECS`, `AVATAR_NORM_STD`, `AVATAR_TIMING`.
 
-### Preprocessing
-#### 1. Target User Speech Extraction from Video
-Please use [IIANet](https://github.com/JusperLee/IIANet) for target speaker extraction and [ClearVoice](https://github.com/modelscope/ClearerVoice-Studio) for speaker separation. We observed that the performance of a generated interactive avatar heavily depends on the quality of its preprocessed data. For example, interaction quality and lip-sync accuracy rely on the performance of audio separation models. 
+The default reference portrait is this repo's `data/rumi.jpg`; point
+`AVATAR_REF_IMAGE` at another photo, or upload one in the UI.
 
-#### 2. User Video Pre-processing
-```bash
-python preprocess_user_video.py --user_video_path data/user.mp4 --output_path data --pad_ratio 1.0
-```
-The outputs will be the frames of input user video and its audio. This script converts given user video into video frames of 25fps and crop the facial region for better conditioning. Please adjust the `--pad_ratio` (default: `1.0`) if you want to scale the size of the bbox.
+## Deployment note
 
+A variant of this runs on Hugging Face ZeroGPU, where the GPU only exists inside
+a `@spaces.GPU` call and every call forks a fresh worker — which a stateful KV
+cache cannot survive. See the `streaming-zerogpu` branch and its
+[ZEROGPU.md](https://github.com/apolinario/AvatarForcing/blob/streaming-zerogpu/ZEROGPU.md):
+it holds one GPU lease per conversation and drives the engine over fork queues
+from the web process.
 
-### Inference
+## License
 
-```bash
-CUDA_VISIBLE_DEVICES=XX python inference.py \ 
-        --input_image_path data/rumi.jpg \ 
-        --avatar_audio_path data/avatar.wav \ 
-        --user_audio_path data/user.wav \ 
-        --user_video_path data/user/ \ 
-        --a_cfg_scale 2 \ 
-        --u_cfg_scale 1 \ 
-        --nfe 10
-```
-
-This repository only supports **minimal Pytorch inference pipeline** using a reference image, avatar audio, and a user video. Real-time conversation demos (e.g., GPT Voice API-based applications) are not included. Building a real-time conversational avatar system using this model and the acceleration techniques from our work is possible, but is not covered in this repository.
-
-Note that you can also use Avatar Forcing for **talking-only** or **Listening-only** head avatar model.
-
-
-## Citation
-```bibtex
-@InProceedings{Ki_2026_CVPR,
-    author    = {Ki, Taekyung and Jang, Sangwon and Jo, Jaehyeong and Yoon, Jaehong and Hwang, Sung Ju},
-    title     = {Avatar Forcing: Real-Time Interactive Head Avatar Generation for Natural Conversation},
-    booktitle = {Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition (CVPR)},
-    month     = {June},
-    year      = {2026},
-    pages     = {18074-18084}
-}
-```
-
-## Related Works
-- FLOAT: Generative Motion Latent Flow Matching for Audio-driven Talking Portrait [ICCV 2025] 
-- Self-Forcig: Bridging the Train-Test Gap in Autoregressive Video Diffusion [Neurips 2025] 
-- History Guided Video Diffusion [ICML 2025] 
-- Diffusion Forcing: Next-token Prediction Meets Full-Sequence Diffusion [Neurips 2024] 
-- INFP: Audio-Driven Interactive Head Generation in Dyadic Conversations [CVPR 2025]
-- IIANet: An Intra- and Inter-Modality Attention Network for Audio-Visual Speech Separation [ICML 2024]
-- Clear Voice. https://github.com/modelscope/ClearerVoice-Studio
-
-
-## Acknowledgements
-The source image used in this codebase was generated with Gemini, and the audio sample was selected from the RealTalk dataset. We would also like to acknowledge the excellent open-source codebases and prior work that inspired and supported this project, including FLOAT, Self-Forcing, Diffusion Forcing, and LIA.
-
+Upstream is CC BY-NC 4.0 (see `LICENSE.md`) and this fork inherits it:
+non-commercial, attribution required, changes indicated (this file and the
+section above). The model checkpoints carry their own upstream terms.
