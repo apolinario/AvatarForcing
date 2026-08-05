@@ -40,7 +40,7 @@ pip install -r requirements.txt
 ### Model checkpoints
 ```bash
 # 3. Download Avatar Forcing model and Wav2Vec2 from HuggingFace
-bash download_weights.sh
+hf download multimodalart/AvatarForcingHelpers --local-dir pretrained_dir
 
 # or manually download the weights from Google Drive
 # https://drive.google.com/drive/folders/1rN52J2QXD8A-r2CZ8nDqFdwvZuPRmMsc?hl=ko

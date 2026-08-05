@@ -112,18 +112,9 @@ Two things had to be fixed to make an unbounded session work:
 
 ## Running it
 
-```bash
-pip install -r requirements-streaming.txt
-export HF_TOKEN=...           # LLM endpoint
-export ELEVEN_TOKEN=...       # TTS
-export VOICE_ID=...
-python app.py                 # http://localhost:7860
-```
-
-Checkpoints are fetched on first start. Upstream's `download_weights.sh` pulls
-them from Google Drive, which rate-limits; `app.py` uses a Hub mirror instead
-(`AVATAR_WEIGHTS_REPO`, default `multimodalart/AvatarForcingHelpers`) and also
-fetches `facebook/wav2vec2-base-960h`.
+See the Quickstart above. Checkpoints are fetched from the Hub on first start
+(`AVATAR_WEIGHTS_REPO`, default `multimodalart/AvatarForcingHelpers`), along
+with `facebook/wav2vec2-base-960h`.
 
 Useful knobs: `AVATAR_DEVICE`, `AVATAR_LEAD_BLOCKS`, `AVATAR_JPEG_QUALITY`,
 `AVATAR_REPRIME_SECS`, `AVATAR_NORM_STD`, `AVATAR_TIMING`.

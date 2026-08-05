@@ -32,12 +32,9 @@ FETCH  = os.environ.get("AVATAR_FETCH_WEIGHTS", "1").lower() not in ("0", "false
 # --------------------------------------------------------------------------- #
 # cold-start weights
 #
-# The Space's disk is wiped when it sleeps, so the checkpoints have to be back
-# on disk before AvatarEngine.load() reads them (build_app / preload_blocking).
-# The authors only distribute the two .pth files via Google Drive
-# (AvatarForcing/download_weights.sh), which rate-limits large files; they are
-# mirrored on the Hub instead. Do not confuse with lycui/AvatarForcing — that is
-# a different model (arXiv 2603.14331) with different checkpoints.
+# Checkpoints come from the Hub (AVATAR_WEIGHTS_REPO). Do not confuse with
+# lycui/AvatarForcing — that is a different model (arXiv 2603.14331) with
+# different checkpoints.
 # --------------------------------------------------------------------------- #
 PRETRAINED = os.path.join(REPO, "pretrained_dir")
 WAV2VEC    = os.path.join(PRETRAINED, "wav2vec2-base-960h")   # configs/inference.yaml: wav2vec_model_path
