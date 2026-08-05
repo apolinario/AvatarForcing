@@ -84,23 +84,13 @@ A conversation spans two connections — the ``/run_session`` job holding the
 lease and the ``/ws`` streaming it — so ``/run_session`` mints a token, hands it
 to the client in ``ready``, and the client presents it as ``?t=`` on ``/ws``.
 
-ZeroGPU
--------
-There is no GPU in this process. Both executors above hand their work to that
-session's ``gpu_session.GPUProxy``, which forwards it over the fork-context
-queue pair for its slot to a worker holding a ``@spaces.GPU`` lease — see
-``server/gpu_session.py`` for why the state cannot live here, and why the queue
-pairs are a pool built at import rather than made per session. Three
-consequences show up in this file:
-
-  * the frame ring, the face cropper and JPEG **encoding** moved into the
-    worker, so ``step`` returns ready-made JPEGs and ``_crop_task`` only ships
-    the ~25 KB webcam frame across;
-  * a session cannot start until the client has acquired a lease (the
-    ``/run_session`` Gradio endpoint, which is also what attaches the visitor's
-    ``X-IP-Token`` so their own quota is billed rather than the Space's IP); and
-  * the lease expires on a wall clock, so any GPU call can raise ``LeaseError``
-    and that ends the session cleanly rather than crashing it.
+GPU backend
+-----------
+Both executors above hand their work to that session's
+``gpu_session.GPUProxy``. On this branch the worker runs in-process on a
+dedicated GPU; on ``streaming-zerogpu`` the identical surface forwards over
+fork-context queues to a ``@spaces.GPU`` lease. Either way a GPU call can
+raise ``LeaseError``, which ends the session cleanly rather than crashing it.
 """
 
 from __future__ import annotations
@@ -905,10 +895,8 @@ def build_app(
                             there is nothing to preload without a GPU.
     default_system_prompt : the brain's built-in prompt, shipped to the client in
                             ``hello`` so its editor opens on the real default.
-                            Passed in (not imported) to keep this module clean of
-                            both the real brain and the mocks.
+                            Passed in rather than imported.
     """
-    import spaces
     from gradio import Server  # imported here so the module is importable w/o gradio
 
     static = static_dir or STATIC_DIR
@@ -918,18 +906,8 @@ def build_app(
     # properties of the registries above, since there can be several of each.
     state: dict[str, Any] = {"sessions_total": 0}
 
-    # ---------------------------------------------------------------- lease -- #
-    # Registered as a Gradio API endpoint rather than a raw route on purpose:
-    # the Gradio JS client performs the `zerogpu-headers` postMessage handshake
-    # with the huggingface.co parent frame and attaches the visitor's
-    # X-IP-Token, so the GPU seconds are billed to whoever is watching instead
-    # of falling back to the Space's shared IP quota.
-    @spaces.GPU(duration=gpu_session.LEASE_SECONDS, size=gpu_session.GPU_SIZE)
+    # ---------------------------------------------------------------- session - #
     def _hold_lease(lease_id: int, slot: int):
-        # Both are passed IN (pickled to the worker) rather than read from module
-        # globals there: ZeroGPU reuses worker processes, and a reused one holds
-        # stale globals. `slot` selects which of the import-time queue pairs this
-        # conversation talks over, which is what lets several run at once.
         yield from gpu_session.gpu_worker_body(
             engine_factory, face_cropper_factory, gpu_session.LEASE_SECONDS,
             speech_factory=speech_factory, lease_id=lease_id, slot=slot)
@@ -1027,13 +1005,9 @@ def build_app(
 
     @app.post("/voice")
     async def voice(request: Request) -> JSONResponse:
-        """Transcribe an uploaded voice clip. Runs in THIS process, on the CPU.
-
-        Deliberately not on the GPU: it happens once, at upload time, before any
-        lease exists, so doing it here costs the visitor no GPU seconds and lets
-        the UI show the transcript before they start. The lease then only builds
-        the voice-clone prompt.
-        """
+        """Transcribe an uploaded voice clip, before any session exists, so the
+        UI can show (and let the user correct) the transcript that will
+        condition the voice clone."""
         if voice_transcriber is None:
             return JSONResponse({"ok": False, "text": "",
                                  "error": "no transcriber configured"},

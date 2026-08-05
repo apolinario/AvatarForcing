@@ -317,6 +317,25 @@ class Speech:
             log.exception("transcribe failed")
             return ""
 
+    def transcribe_bytes(self, data: bytes) -> str:
+        """Transcribe an uploaded clip (any container ffmpeg reads).
+
+        Only the first ``REF_MAX_SECS`` are transcribed — the same span the
+        voice clone uses, so the transcript describes what the clone hears.
+        """
+        pipe = getattr(self.model, "_asr_pipe", None)
+        if pipe is None:
+            return ""
+        try:
+            from transformers.pipelines.audio_utils import ffmpeg_read
+
+            wav = ffmpeg_read(data, WIRE_SR)[: int(REF_MAX_SECS * WIRE_SR)]
+            out = pipe(wav)
+            return ((out or {}).get("text") or "").strip()
+        except Exception:
+            log.exception("upload transcription failed")
+            return ""
+
     def transcribe(self, pcm_i16: bytes, sr: int = WIRE_SR) -> dict:
         """Live STT over one VAD-delimited utterance of 16 kHz int16 PCM."""
         if not pcm_i16:

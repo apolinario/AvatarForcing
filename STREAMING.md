@@ -11,6 +11,31 @@ into a two-way conversation.
 Nothing about the model or the checkpoints changes. The rollout is upstream's,
 one block at a time.
 
+The conversation stack is fully local apart from the LLM: OmniVoice voice
+cloning for the avatar's speech (phrase-at-a-time), Whisper large-v3-turbo for
+listening, smart-turn-v3 for semantic end-of-turn (the avatar answers when you
+finish a thought, not after a fixed silence), speculative transcription
+(Whisper runs while the turn detector is still deciding), barge-in, and
+built-in avatars with cloned voices and personas.
+
+## Quickstart (local GPU)
+
+```bash
+git clone -b streaming https://github.com/apolinario/AvatarForcing
+cd AvatarForcing
+pip install -r requirements-streaming.txt
+export HF_TOKEN=hf_...        # any OpenAI-compatible LLM endpoint works; the
+                              # default is the HF router (see server/conversation.py)
+python app.py                 # downloads checkpoints on first run, then serves :7860
+```
+
+Open http://localhost:7860, allow camera and microphone, press Start.
+
+To run on Hugging Face (a paid dedicated-GPU Space): push this branch to a
+Space with `app_file: app.py`. For free ZeroGPU hosting use the
+[`streaming-zerogpu`](../../tree/streaming-zerogpu) branch, which is this
+server behind a per-conversation GPU lease.
+
 ```
 browser ──webcam JPEG + mic PCM──▶  server/web.py  ──▶ server/engine.py ──▶ AvatarForcing
         ◀──avatar JPEG + PCM─────                  ──▶ server/conversation.py ──▶ LLM + TTS

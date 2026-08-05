@@ -1406,8 +1406,7 @@ async function startSession(opts){
       String((e && e.message) || e) +
       (busy
         ? "<br><small>One session runs at a time. Try again in a moment.</small>"
-        : "<br><small>If this mentions quota: ZeroGPU quota is per viewer and " +
-          "refills daily.</small>"), false);
+        : ""), false);
     return;
   }
 
