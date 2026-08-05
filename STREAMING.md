@@ -93,7 +93,6 @@ export VOICE_ID=...
 python app.py                 # http://localhost:7860
 ```
 
-Checkpoints are fetched on first start. Upstream's `download_weights.sh` pulls
 them from Google Drive, which rate-limits; `app.py` uses a Hub mirror instead
 (`AVATAR_WEIGHTS_REPO`, default `multimodalart/AvatarForcingHelpers`) and also
 fetches `facebook/wav2vec2-base-960h`.
