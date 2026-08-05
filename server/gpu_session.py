@@ -1,47 +1,23 @@
 """ZeroGPU held-lease GPU worker + parent-side RPC proxy.
 
-Why this module exists
-----------------------
-The dedicated-GPU Space keeps one CUDA context alive for the process lifetime
-and calls ``engine.step()`` every 400 ms, rolling a KV cache forward. Neither
-half of that is available on ZeroGPU:
+ZeroGPU imposes two constraints: there is no GPU outside ``@spaces.GPU``, and
+every ``@spaces.GPU`` call runs in a separate worker process, so per-call
+decorators would lose the engine's KV cache between blocks. The GPU is
+therefore leased once per conversation: ``gpu_worker_body`` is the body of a
+``@spaces.GPU`` generator that warms the engine, then serves an RPC loop over
+fork-context queues until the lease expires.
 
-* there is **no GPU outside** ``@spaces.GPU``, so ``engine.load()``'s warm-up and
-  ``FaceCropper``'s SFD detections cannot run in the web process; and
-* every ``@spaces.GPU`` call **forks a fresh worker**, so a per-block decorator
-  would throw the KV cache away between blocks (module globals set in one call
-  are simply absent in the next).
+The worker owns the face cropper, the cropped-frame ring and JPEG encoding, so
+the wire carries ~25 KB of webcam JPEG in and ~200 KB of encoded frames out
+per 400 ms block instead of ~16 MB of raw frames.
 
-So the GPU is leased **once per conversation**. :func:`run_session` is a
-``@spaces.GPU`` generator: entering it forks a worker that restores the packed
-weights, warms the engine, announces ``__READY__`` and then serves an RPC loop
-until the lease expires. The web process talks to it through a pair of
-fork-context queues created at *import* time — created in the parent before any
-fork, they are inherited by the worker with their pipe fds intact, so the parent
-can keep pushing work into a worker that is already blocked on ``get()``.
+The worker runs three interchangeable dispatch lanes so a 400 ms ``step``, a
+~20 ms crop and a ~740 ms speech synthesis never head-of-line block each other
+in the queue (they still serialise on the GPU). Threads only: a ``@spaces.GPU``
+fork is daemonic and cannot spawn child processes.
 
-Wire economy
-------------
-The naive split (parent crops, ships ``[10,512,512,3]`` in and out) would push
-~16 MB per 400 ms block through a pickle pipe. Instead the worker owns the face
-cropper, the cropped-frame ring *and* JPEG encoding, so the traffic is ~25 KB of
-webcam JPEG in and ~200 KB of encoded frames out — about 1.5% of that.
-
-Threading
----------
-The worker runs three interchangeable dispatch lanes so that the three kinds of
-work in flight — a 400 ms ``step()``, a ~20 ms crop, and a ~740 ms speech
-synthesis — never head-of-line block each other in the queue. They still
-serialise on the GPU; the lanes only stop a long job from delaying the dispatch
-of a short one. Threads only — a ``@spaces.GPU`` fork is daemonic and cannot
-spawn child processes.
-
-Speech
-------
-The worker also hosts OmniVoice TTS and Whisper STT (``server/speech.py``),
-which replaced ElevenLabs. That moves speech from a network call in the web
-process onto the same leased GPU as the avatar engine, so the two now share a
-budget — see ``server/speech.py`` for the arithmetic.
+The worker also hosts OmniVoice TTS and Whisper STT (``server/speech.py``) on
+the same leased GPU.
 """
 
 from __future__ import annotations
@@ -52,6 +28,7 @@ import logging
 import multiprocessing as _mp
 import os
 import queue as _queue
+import secrets
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -64,29 +41,20 @@ log = logging.getLogger("avatar.gpu")
 # --------------------------------------------------------------------------- #
 # tuning
 # --------------------------------------------------------------------------- #
-# Seconds of *conversation* the visitor gets. The clock starts when the engine
-# is warm and __READY__ goes out, not when the GPU is granted -- otherwise the
-# warm-up silently eats a chunk of the session (measured: 11 s cold / 4 s warm,
-# i.e. a "90 s" lease delivering 76 s of talking).
+# Seconds of conversation the visitor gets. The clock starts when the engine is
+# warm, not when the GPU is granted, so warm-up never eats conversation time.
 SESSION_SECONDS = int(os.environ.get("AVATAR_SESSION_SECONDS", "90"))
-# Headroom reserved for that warm-up when asking ZeroGPU for the lease. Covers
-# the engine warm (4-13 s) plus loading the live ASR model, which has to happen
-# in here rather than at import -- see server/speech.py.
+# Headroom for that warm-up: engine warm (4-13 s) plus the live ASR model,
+# which cannot load before the lease (server/speech.py).
 WARM_ALLOWANCE = float(os.environ.get("AVATAR_WARM_ALLOWANCE", "25.0"))
-# Stop serving this many seconds before the lease actually lapses, so the worker
-# tears down cleanly instead of being killed mid-step.
+# Stop serving this many seconds early so the worker tears down cleanly.
 LEASE_MARGIN = float(os.environ.get("AVATAR_LEASE_MARGIN", "3.0"))
-# What @spaces.GPU(duration=...) actually requests. Larger values queue lower
-# and are checked against the visitor's remaining quota as a whole, so this is
-# the conversation plus just enough slack to cover a cold warm-up.
+# What @spaces.GPU(duration=...) requests. Longer leases queue lower and weigh
+# more against the visitor's quota, so no more slack than warm-up needs.
 LEASE_SECONDS = int(SESSION_SECONDS + WARM_ALLOWANCE + LEASE_MARGIN)
-# large = half the Blackwell card (48 GB, 1x quota); xlarge = the full card
-# (96 GB, 2x quota) and therefore full SM count.
-#
-# Measured on the half-MIG with the real pipeline: engine step 202-224 ms and
-# 213-236 ms including the fork round-trip, against a 400 ms block budget, with
-# 0 late blocks and 0 dropped frames over 187 blocks. xlarge would cost 2x the
-# visitor's quota to buy headroom that is already there, so: large.
+# "large" is half the card (48 GB, 1x quota): the full pipeline steps in
+# ~150-230 ms against a 400 ms block budget, so "xlarge" would double the
+# visitor's quota cost for headroom that is already there.
 GPU_SIZE = os.environ.get("AVATAR_GPU_SIZE", "large")
 # How long a parent-side RPC waits before giving up on the worker.
 CALL_TIMEOUT = float(os.environ.get("AVATAR_CALL_TIMEOUT", "120.0"))
@@ -97,32 +65,56 @@ OUT_JPEG_SUBSAMPLING = int(os.environ.get("AVATAR_JPEG_SUBSAMPLING", "2"))
 REPRIME_XFADE = int(os.environ.get("AVATAR_REPRIME_XFADE", "10"))
 
 # --------------------------------------------------------------------------- #
-# fork-context queues -- MUST be constructed at import, in the parent, before
-# any @spaces.GPU call forks. A queue made inside the worker would not be
-# visible to the parent, and one made lazily after the first fork would not be
-# inherited by it.
+# fork-context queues, one pair per concurrent session, ALL built at import.
+#
+# ZeroGPU reuses worker processes, and a reused worker only has the module
+# globals from its original fork -- a queue created later is invisible to it.
+# A pool that predates every fork is visible to all of them; sessions claim a
+# slot and pass its index (an int pickles, a Queue does not).
 # --------------------------------------------------------------------------- #
 _CTX = _mp.get_context("fork")
-REQ_Q: Any = _CTX.Queue()      # parent -> worker: (seq, lane, method, args)
-RES_Q: Any = _CTX.Queue()      # worker -> parent: (seq, ok, payload)
+
+# Concurrent conversations. Each holds its own worker with its own restored
+# copy of the weights, so the bound is VRAM, not the ZeroGPU scheduler.
+MAX_SESSIONS = int(os.environ.get("AVATAR_MAX_SESSIONS", "4"))
+
+LANES: list[tuple[Any, Any]] = [
+    (_CTX.Queue(),   # parent -> worker: (lease_id, seq, lane, method, args)
+     _CTX.Queue())   # worker -> parent: (seq, ok, payload)
+    for _ in range(MAX_SESSIONS)]
+
+_SLOT_LOCK = threading.Lock()
+_SLOTS_FREE: list[int] = list(range(MAX_SESSIONS))
+
+
+def claim_slot() -> int | None:
+    """Take a free session slot, or None when the Space is at capacity."""
+    with _SLOT_LOCK:
+        return _SLOTS_FREE.pop(0) if _SLOTS_FREE else None
+
+
+def release_slot(slot: int) -> None:
+    with _SLOT_LOCK:
+        if slot not in _SLOTS_FREE:
+            _SLOTS_FREE.append(slot)
+            _SLOTS_FREE.sort()
+
+
+def slots_in_use() -> int:
+    with _SLOT_LOCK:
+        return MAX_SESSIONS - len(_SLOTS_FREE)
 
 _STOP = "__stop__"
 _LEASE_GONE = "__lease_gone__"     # distinguishes "worker vanished" from "call raised"
 LANE_ENGINE = "engine"
 LANE_CROP = "crop"
 
-# Which lease the parent is talking to. Bumped by GPUProxy.open() and passed to
-# the worker as a CALL ARGUMENT -- deliberately not left to fork inheritance.
-#
-# ZeroGPU reuses worker processes ("engine warm in 0.0s" on a second lease gives
-# it away), and a reused worker still holds the LEASE_ID from whenever it was
-# first forked. Relying on inheritance therefore made the worker reject every
-# request from the new lease, and the session hung with 0 frames cropped.
-#
-# The id exists because a session ending on lease expiry can leave a `step` in
-# flight; without it the next lease runs that stale call against an engine that
-# was never primed ("call start_session() before step()").
-LEASE_ID = 0
+# Which lease each slot's parent is talking to. Stamped on every request so a
+# worker can reject calls left in the queue by a dead session, and passed as a
+# call argument rather than read from a module global in the worker (a reused
+# worker's globals are stale). Per slot: sessions are independent.
+LEASE_IDS: list[int] = [0] * MAX_SESSIONS
+_LEASE_LOCK = threading.Lock()
 
 
 # =========================================================================== #
@@ -189,8 +181,8 @@ class _Worker:
 
     def prime(self) -> dict:
         """``start_session`` on the first cropped frame. Primed frames are
-        discarded, exactly as the dedicated Space does — the client shows the
-        reference photo until the first generated block lands."""
+        discarded; the client shows the reference photo until the first
+        generated block lands."""
         with self._lock:
             first = self.first_frame
         if first is None:
@@ -239,10 +231,6 @@ class _Worker:
         return {}
 
     # -- speech RPC ------------------------------------------------------- #
-    # Phrase-at-a-time rather than one call per utterance: OmniVoice cannot
-    # stream below chunk granularity, so the phrase IS the streaming unit, and
-    # a short phrase also keeps each GPU burst small enough for the avatar
-    # engine's per-block budget.
     def tts_set_voice(self, ref_bytes, ref_text, key) -> dict:
         return self.speech.set_voice(ref_bytes, ref_text, key)
 
@@ -262,22 +250,21 @@ class _Worker:
 
 
 def _serve(worker: _Worker, deadline: float, stop: threading.Event,
-           my_lease: int) -> None:
-    """Pull work off ``REQ_Q`` and answer on ``RES_Q`` until stopped or expired.
+           my_lease: int, slot: int) -> None:
+    """Pull work off this slot's queues until stopped or expired.
 
-    Lanes are interchangeable pullers, not routed queues: two of them run so a
-    ~20 ms ``push_frame`` never waits behind a ~400 ms ``step``, which is the
-    same overlap the dedicated Space got from its separate crop/GPU executors.
-    ``web.py`` keeps at most one crop and one step in flight, and speech adds a
-    third, so three is enough. They still serialise on the GPU -- the point is
-    that a ~740 ms synthesis does not head-of-line block a 20 ms crop.
+    Lanes are interchangeable pullers, not routed queues: they exist so a
+    ~20 ms crop or a speech call never waits behind a ~400 ms ``step`` in the
+    queue. web.py keeps at most one crop and one step in flight and speech
+    adds a third caller, so three lanes suffice.
     """
+    req_q, res_q = LANES[slot]
     while not stop.is_set():
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             return
         try:
-            item = REQ_Q.get(timeout=min(0.25, remaining))
+            item = req_q.get(timeout=min(0.25, remaining))
         except _queue.Empty:
             continue
         except (EOFError, OSError):
@@ -289,36 +276,25 @@ def _serve(worker: _Worker, deadline: float, stop: threading.Event,
         if lease_id != my_lease:
             # A previous session's in-flight call. Answering it as a dead lease
             # lets that session finish dying instead of it corrupting this one.
-            log.info("dropping stale request %s from lease %s (serving %s)",
-                     method, lease_id, my_lease)
-            RES_Q.put((seq, _LEASE_GONE, "that GPU session has ended"))
+            log.info("slot %d dropping stale request %s from lease %s (serving %s)",
+                     slot, method, lease_id, my_lease)
+            res_q.put((seq, _LEASE_GONE, "that GPU session has ended"))
             continue
         try:
             payload = getattr(worker, method)(*args)
-            RES_Q.put((seq, True, payload))
+            res_q.put((seq, True, payload))
         except Exception as exc:                # never kill the lane on one bad call
             log.exception("rpc %s failed", method)
-            RES_Q.put((seq, False, f"{type(exc).__name__}: {exc}"))
+            res_q.put((seq, False, f"{type(exc).__name__}: {exc}"))
 
 
 def _pin_cudnn_benchmark_off() -> None:
     """Make ``cudnn.benchmark = True`` a no-op for the life of the worker.
 
-    ``face_alignment``'s SFD detector sets it on *every* ``detect_from_image``,
-    so each new input shape pays a full cuDNN autotune. ``detect_box`` rescales
-    to a fixed HEIGHT, so the width still tracks the source aspect ratio: the
-    default reference and the square webcam frames share one shape, but an
-    arbitrary user upload is a shape nothing has warmed.
-
-    On the dedicated Space that cost was paid once per process lifetime (which
-    is why set_reference is documented there at 56 ms). On ZeroGPU every lease
-    is a fresh fork, so it was paid *every session* -- measured at 3.2 s for
-    set_reference, 3.8 s to prime and a 5.7 s first step, which left the block
-    loop 45 blocks behind and the avatar frozen on the reference photo.
-
-    The engine already asks for ``benchmark = False`` (see AvatarEngine.load);
-    this just stops face_alignment from overriding it. Heuristic algo choice
-    costs a little per conv and saves seconds of autotune.
+    ``face_alignment``'s SFD detector re-enables it on every detection, and
+    with benchmark on every new input shape pays a multi-second cuDNN autotune
+    -- inside the visitor's session, since each lease is a fresh fork.
+    Heuristic algorithm choice costs a little per conv and saves seconds.
     """
     import torch
 
@@ -333,14 +309,14 @@ def _pin_cudnn_benchmark_off() -> None:
 
 
 def gpu_worker_body(engine_factory, cropper_factory, lease_seconds: int,
-                    speech_factory=None, lease_id: int = 0):
+                    speech_factory=None, lease_id: int = 0, slot: int = 0):
     """The body of the lease. A generator so the caller can stream progress.
 
-    Yields ``"__READY__"`` once the engine is warm, then a ``{"remaining": n}``
-    heartbeat roughly once a second, then ``"__EXPIRED__"``.
+    Yields a ``ready`` event once everything is warm, then a per-second
+    ``tick`` with the remaining seconds, then ``expired``.
     """
     t_lease_start = time.monotonic()
-    # Hard stop: whatever else happens, be done before ZeroGPU reclaims us.
+    # Be done before ZeroGPU reclaims the process.
     hard_deadline = t_lease_start + lease_seconds - LEASE_MARGIN
 
     t0 = time.perf_counter()
@@ -351,9 +327,8 @@ def gpu_worker_body(engine_factory, cropper_factory, lease_seconds: int,
     engine.warm()
     cropper = cropper_factory() if cropper_factory is not None else None
     if cropper is not None:
-        # index.html always sends a square frame, which the cropper rescales to
-        # 360x360 -- a shape the engine's own 360x480 warm-up does not cover, and
-        # whose first cuDNN autotune otherwise lands on the first webcam frame.
+        # Warm the square webcam-frame shape; the engine warm-up covers only
+        # the reference shape.
         rng = np.random.default_rng(0)
         size = int(os.environ.get("AVATAR_CAM_WARM_SIZE", "384"))
         try:
@@ -363,9 +338,6 @@ def gpu_worker_body(engine_factory, cropper_factory, lease_seconds: int,
         except Exception:
             log.exception("cropper warm-up failed (non-fatal)")
     warm_s = time.perf_counter() - t0
-    # The session clock starts HERE, so a cold warm-up costs the visitor slack
-    # from WARM_ALLOWANCE rather than conversation time. Capped by the hard
-    # deadline in case the warm-up overran that allowance.
     log.info("engine warm in %.1fs", warm_s)
 
     speech = None
@@ -378,41 +350,52 @@ def gpu_worker_body(engine_factory, cropper_factory, lease_seconds: int,
         except Exception:
             log.exception("speech init failed -- the avatar will be mute")
 
-    # The session clock starts HERE -- after EVERYTHING that has to happen
-    # before the first block, speech included. Setting it before speech init
-    # handed the visitor 63 s of a 90 s session, because loading the AoTI
-    # package and the ASR model ran on their clock.
+    # Session clock starts after everything the first block needs, speech
+    # included; warm-up runs on WARM_ALLOWANCE, not conversation time.
     deadline = min(time.monotonic() + SESSION_SECONDS, hard_deadline)
     log.info("lease up: warm %.1fs total, %.0fs of session",
              time.monotonic() - t_lease_start, deadline - time.monotonic())
 
     worker = _Worker(engine, cropper, speech)
 
-    # Drain anything a previous, aborted session left behind, so this lease does
-    # not answer a stale request with a fresh sequence number.
+    # Drain requests a previous, aborted session left behind.
     while True:
         try:
-            REQ_Q.get_nowait()
+            LANES[slot][0].get_nowait()
         except _queue.Empty:
             break
 
     stop = threading.Event()
     lanes = [threading.Thread(target=_serve,
-                              args=(worker, deadline, stop, lease_id),
+                              args=(worker, deadline, stop, lease_id, slot),
                               name=f"gpu-lane-{i}", daemon=True)
              for i in range(3)]
     for t in lanes:
         t.start()
 
-    yield {"event": "ready", "warm_seconds": round(warm_s, 1),
-           "session_seconds": round(deadline - time.monotonic(), 1)}
+    # The lanes must not outlive this generator: the process is reused, and a
+    # lane still running after its lease ended would compete with the next
+    # lease for the same queue. Early exit (visitor presses stop) is the
+    # common path, hence the finally.
+    try:
+        yield {"event": "ready", "warm_seconds": round(warm_s, 1),
+               "session_seconds": round(deadline - time.monotonic(), 1)}
 
-    while any(t.is_alive() for t in lanes):
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            break
-        time.sleep(min(1.0, remaining))
-        yield {"event": "tick", "remaining": round(max(0.0, deadline - time.monotonic()), 1)}
+        while any(t.is_alive() for t in lanes):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            time.sleep(min(1.0, remaining))
+            yield {"event": "tick",
+                   "remaining": round(max(0.0, deadline - time.monotonic()), 1)}
+    finally:
+        # Runs on normal expiry AND on GeneratorExit when the client cancels.
+        stop.set()
+        for t in lanes:
+            t.join(timeout=2.0)
+        still = [t.name for t in lanes if t.is_alive()]
+        if still:
+            log.warning("lanes did not stop: %s (a call is mid-flight)", still)
 
     log.info("lease over after %.0fs", time.monotonic() - t_lease_start)
     yield {"event": "expired"}
@@ -433,7 +416,10 @@ class GPUProxy:
     thread drains ``RES_Q`` into per-sequence slots instead.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, slot: int = 0) -> None:
+        # One proxy per conversation, bound to its slot's queue pair.
+        self.slot = slot
+        self.req_q, self.res_q = LANES[slot]
         self._seq = 0
         self.lease_id = 0
         self._seq_lock = threading.Lock()
@@ -447,28 +433,26 @@ class GPUProxy:
 
     # -- lifecycle -------------------------------------------------------- #
     def open(self) -> None:
-        global LEASE_ID
-        # Must happen before the @spaces.GPU call forks: the worker reads this
-        # global to recognise its own traffic.
-        LEASE_ID += 1
-        self.lease_id = LEASE_ID
+        # Set before the @spaces.GPU call: the worker compares against it to
+        # recognise its own traffic.
+        with _LEASE_LOCK:
+            LEASE_IDS[self.slot] += 1
+            self.lease_id = LEASE_IDS[self.slot]
         self.reference_is_default = True   # a fresh worker starts on the default
         self._alive.set()
         self.last_error = None
         if self._reader is None or not self._reader.is_alive():
-            self._reader = threading.Thread(target=self._drain, name="gpu-rpc-reader",
+            self._reader = threading.Thread(target=self._drain,
+                                            name=f"gpu-rpc-reader-{self.slot}",
                                             daemon=True)
             self._reader.start()
 
     def close(self, reason: str = "lease ended") -> None:
         self._alive.clear()
         self.last_error = reason
-        # NOTE: deliberately does NOT put a stop sentinel on REQ_Q. close() runs
-        # in run_session's finally, i.e. *after* the worker is already gone, so
-        # the sentinel would just sit in the queue -- and the NEXT lease's lanes
-        # would read it and shut down instantly ("lease over after 5s", right
-        # after warm-up). The lanes end on their own deadline; the client
-        # cancelling the /run_session job ends the lease early.
+        # No stop sentinel on the request queue: close() runs after the worker
+        # is gone, so the sentinel would sit there and shut down the NEXT
+        # lease's lanes instead. Lanes end on their own deadline.
         with self._cv:
             for slot in self._pending.values():
                 slot[:] = [_LEASE_GONE, reason]
@@ -482,7 +466,7 @@ class GPUProxy:
     def _drain(self) -> None:
         while True:
             try:
-                seq, ok, payload = RES_Q.get(timeout=1.0)
+                seq, ok, payload = self.res_q.get(timeout=1.0)
             except _queue.Empty:
                 if not self._alive.is_set():
                     return
@@ -508,7 +492,7 @@ class GPUProxy:
         with self._cv:
             self._pending[seq] = slot
         try:
-            REQ_Q.put((self.lease_id, seq, lane, method, args))
+            self.req_q.put((self.lease_id, seq, lane, method, args))
             end = time.monotonic() + timeout
             with self._cv:
                 while not slot:
@@ -520,11 +504,8 @@ class GPUProxy:
         finally:
             with self._cv:
                 self._pending.pop(seq, None)
-        # `==`, not `is`: the sentinel crosses a pickle boundary coming back
-        # from the worker, so the parent unpickles a DIFFERENT string object.
-        # With `is` this test never fired, the truthy sentinel slipped past the
-        # `not ok` check, and a rejected call returned its error message as if
-        # it were a result -- which then hung the session instead of failing it.
+        # `==`, not `is`: the sentinel crosses a pickle boundary, so identity
+        # never matches.
         if ok == _LEASE_GONE:       # worker is gone, or refused a stale lease
             raise LeaseError(str(payload))
         if ok is not True:          # the worker ran the call and it raised
@@ -553,10 +534,8 @@ class GPUProxy:
         self.call("reset_cropper", lane=LANE_CROP, timeout=30.0)
 
     # -- speech ------------------------------------------------------------ #
-    # These run on the crop lane, not the engine lane: the engine lane is the
-    # 400 ms block loop, and queueing a ~740 ms synthesis behind (or in front
-    # of) a step would stall video for a whole block. The two lanes are
-    # interchangeable pullers, so this just means "not behind the steps".
+    # Crop lane, not engine lane: a synthesis queued behind a step would stall
+    # video for a block.
     def tts_set_voice(self, ref_bytes, ref_text, key="") -> dict:
         return self.call("tts_set_voice", ref_bytes, ref_text, key,
                          lane=LANE_CROP, timeout=120.0)
@@ -574,6 +553,37 @@ class GPUProxy:
             return {}
 
 
-# One proxy per process; the queues are module-global singletons, so there can
-# only ever be one lease in flight anyway.
-PROXY = GPUProxy()
+# =========================================================================== #
+# session registry
+# =========================================================================== #
+# A conversation spans two connections -- the /run_session job holding the
+# lease and the /ws streaming it. run_session mints a token, hands it to the
+# client in `ready`, and the client presents it when opening /ws.
+_SESSIONS: dict[str, "GPUProxy"] = {}
+_SESSIONS_LOCK = threading.Lock()
+
+
+def new_session() -> tuple[str, "GPUProxy"] | None:
+    """Claim a slot and register a proxy for it. None when at capacity."""
+    slot = claim_slot()
+    if slot is None:
+        return None
+    token = secrets.token_urlsafe(16)
+    proxy = GPUProxy(slot)
+    with _SESSIONS_LOCK:
+        _SESSIONS[token] = proxy
+    return token, proxy
+
+
+def get_session(token: str | None) -> "GPUProxy | None":
+    if not token:
+        return None
+    with _SESSIONS_LOCK:
+        return _SESSIONS.get(token)
+
+
+def end_session(token: str) -> None:
+    with _SESSIONS_LOCK:
+        proxy = _SESSIONS.pop(token, None)
+    if proxy is not None:
+        release_slot(proxy.slot)

@@ -18,7 +18,6 @@ completely decoupled from whatever loop (or plain sync code) creates it.
 ``feed_user_audio`` / ``set_user_snapshot`` / ``pull_avatar_audio`` are cheap,
 non-blocking, lock-protected and safe to call from any thread.
 
-See reports/conversation.md for measured latencies and configuration notes.
 """
 
 from __future__ import annotations
@@ -122,11 +121,37 @@ class BrainConfig:
     vad_end_factor: float = 1.8
     vad_abs_floor: float = 220.0                # int16 rms; below this is never speech
     vad_min_speech_ms: int = 120
-    vad_hangover_ms: int = 500
+    # Silence before asking Smart Turn whether the turn ended. Not below ~200:
+    # stop consonants close the vocal tract for 50-150 ms, and a shorter
+    # hangover fires speech_end inside words. With turn_detector="hangover"
+    # this is the whole decision, so raise it to ~500 if the model is off.
+    vad_hangover_ms: int = 200
+
+    # --- semantic end-of-turn (server/turn_detect.py) ---
+    # "smart" -> ask the model; "hangover" -> trust vad_hangover_ms alone.
+    turn_detector: str = "smart"
+    # The confidence bar starts strict and relaxes as the silence grows: the
+    # model is ~94% accurate per probe, probes fire at every pause, and a
+    # clause can sound complete while the speaker means to continue -- a flat
+    # bar commits a false "complete" per utterance. A short pause must be very
+    # convincing (turn_threshold_early); by turn_relax_ms the bar is down to
+    # turn_threshold, and turn_max_wait_ms commits regardless.
+    turn_threshold: float = 0.5                 # the relaxed (late) bar
+    turn_threshold_early: float = 0.85          # the bar right at the trigger
+    turn_relax_ms: int = 700                    # silence at which the bar bottoms out
+    # While it keeps saying "not finished", re-ask this often.
+    turn_reprobe_ms: int = 100
+    # Never hold a turn longer than this after speech stops: bounds the damage
+    # if the model dislikes an accent or a noise floor. Worst case is a fixed
+    # wait, i.e. plain-hangover behaviour.
+    turn_max_wait_ms: int = 1200
 
     # --- barge-in ---
     barge_in: bool = True
-    barge_in_min_speech_ms: int = 280           # sustained speech needed to interrupt
+    # Sustained speech needed to interrupt: short enough to feel responsive,
+    # long enough that a cough, a keyboard knock or the avatar's own voice
+    # leaking into an open mic does not cancel the rest of a reply.
+    barge_in_min_speech_ms: int = 600
     barge_in_grace_ms: int = 250                # ignore VAD right after we start speaking
 
     # --- buffers ---
@@ -300,25 +325,25 @@ class PhraseChunker:
 class _OmniVoiceTTS:
     """Phrase-at-a-time synthesis on the leased GPU, one instance per turn.
 
-    Keeps the interface the turn loop already used for the ElevenLabs websocket
-    (``open`` / ``send_text`` / ``finish`` / ``close`` / ``error``) so the loop
-    itself is unchanged: it still pushes phrases as the LLM emits them.
-
-    What changed underneath is the streaming granularity. A websocket streamed
-    audio continuously; OmniVoice is a masked diffusion LM that denoises a whole
-    fixed-length chunk at once, so the smallest unit it can emit is a phrase.
-    Phrases are synthesised **in order** by a single consumer task, because the
-    avatar audio buffer is a byte stream and two concurrent syntheses would
-    interleave into noise.
+    The turn loop pushes phrases as the LLM emits them (``open`` /
+    ``send_text`` / ``finish`` / ``close``). OmniVoice is a masked diffusion
+    LM that denoises a whole chunk at once, so the phrase is the smallest unit
+    it can emit. Phrases are synthesised **in order** by a single consumer
+    task: the avatar audio buffer is a byte stream, and two concurrent
+    syntheses would interleave into noise.
 
     Each ``synth`` is a blocking RPC to the GPU worker, so it runs in a thread —
     the brain's event loop must stay responsive to keep feeding the mic and
     honouring barge-in.
     """
 
-    def __init__(self, cfg: BrainConfig, on_pcm: t.Callable[[bytes], None]):
+    def __init__(self, cfg: BrainConfig, on_pcm: t.Callable[[bytes], None],
+                 proxy: t.Any):
         self.cfg = cfg
         self.on_pcm = on_pcm
+        # This conversation's GPU handle. Passed in rather than imported: with
+        # several sessions live there is no single module-global proxy.
+        self.proxy = proxy
         self.final = asyncio.Event()
         self.first_audio_at: t.Optional[float] = None
         self.opened_at: t.Optional[float] = None
@@ -338,8 +363,9 @@ class _OmniVoiceTTS:
         self._task = asyncio.create_task(self._consume(), name="tts-consume")
 
     async def _consume(self) -> None:
-        from server.gpu_session import PROXY, LeaseError
+        from server.gpu_session import LeaseError
 
+        proxy = self.proxy
         try:
             while True:
                 text = await self._q.get()
@@ -348,7 +374,7 @@ class _OmniVoiceTTS:
                 if self._closed:
                     continue
                 try:
-                    res = await asyncio.to_thread(PROXY.tts_synth, text)
+                    res = await asyncio.to_thread(proxy.tts_synth, text)
                 except LeaseError as exc:
                     self.error = f"GPU session ended: {exc}"
                     break
@@ -415,11 +441,14 @@ class ConversationBrain:
         await brain.stop()
     """
 
-    def __init__(self, on_event: t.Callable[[dict], None], config: t.Optional[BrainConfig] = None, **overrides: t.Any):
+    def __init__(self, on_event: t.Callable[[dict], None], config: t.Optional[BrainConfig] = None,
+                 proxy: t.Any = None, **overrides: t.Any):
         cfg = config or BrainConfig()
         if overrides:
             cfg = replace(cfg, **overrides)
         self.cfg = cfg.resolved()
+        # The GPU handle for THIS conversation (see _OmniVoiceTTS).
+        self.proxy = proxy
         self._on_event_cb = on_event
 
         # --- cross-thread state ---
@@ -469,6 +498,20 @@ class ConversationBrain:
         # --- instrumentation (used by the test harness / report) ---
         self.metrics: t.Dict[str, t.Any] = {"turns": []}
         self._last_speech_end_wall: t.Optional[float] = None
+        # Smart Turn said "not finished" and we are holding the turn open.
+        self._awaiting_turn = False
+        self._turn_speech_ms = 0.0
+        self._turn_deadline = 0.0
+        self._turn_next_probe = 0.0
+        self._turn_silence_since = 0.0
+        # Speculative transcription launched while the endpoint gate is still
+        # deliberating: (speech generation it belongs to, task). Valid only
+        # while no new speech has started since it launched.
+        self._spec_stt: t.Optional[t.Tuple[int, asyncio.Task]] = None
+        self._speech_gen = 0
+        # Speech (ms) in the utterance now being transcribed; see
+        # _is_hallucination.
+        self._utterance_speech_ms = 0.0
 
     # ------------------------------------------------------------------ #
     # public, thread-safe API
@@ -720,10 +763,105 @@ class ConversationBrain:
             except Exception as exc:
                 self._error(f"audio pipeline: {type(exc).__name__}: {exc}")
 
+    async def _turn_probe(self) -> t.Optional[float]:
+        """P(the user has finished) over the utterance so far, off-loop."""
+        from server.turn_detect import DETECTOR
+
+        buf = bytes(self._batch_buf)
+        if not buf:
+            return None
+        audio = np.frombuffer(buf, dtype="<i2").astype(np.float32) / 32768.0
+        return await asyncio.to_thread(DETECTOR.probability, audio)
+
+    async def _gate_turn_end(self, events: t.List[t.Tuple[str, float]],
+                             ) -> t.List[t.Tuple[str, float]]:
+        """Turn the VAD's silence timeout into a semantic decision.
+
+        ``vad_hangover_ms`` is only 50 ms now, so a raw ``speech_end`` means
+        "they paused", not "they finished". Each one is put to Smart Turn: if it
+        says finished the event passes through and the turn commits, otherwise
+        it is swallowed and we keep listening. While swallowed we re-ask every
+        ``turn_reprobe_ms``, and commit regardless after ``turn_max_wait_ms`` so
+        a model that never says "finished" cannot strand the conversation.
+
+        The utterance buffer keeps growing throughout, because
+        ``_stt_feed_batch`` accumulates on ``_batch_active`` rather than on
+        these events -- so a swallowed pause costs nothing and the eventual
+        transcript covers the whole thing, mid-sentence pauses included.
+        """
+        if self.cfg.turn_detector != "smart" or self.cfg.stt_transport != "batch":
+            return events
+        now = time.monotonic()
+        out: t.List[t.Tuple[str, float]] = []
+        for kind, ms in events:
+            if kind != "speech_end":
+                if kind == "speech_start":
+                    self._awaiting_turn = False   # they carried on; question moot
+                out.append((kind, ms))
+                continue
+            # The silence clock started vad_hangover_ms before this event fired.
+            self._turn_silence_since = now - self.cfg.vad_hangover_ms / 1000.0
+            need = self._turn_required_p(self.cfg.vad_hangover_ms)
+            # Transcribe concurrently with the decision, not after it.
+            self._launch_spec_stt()
+            p = await self._turn_probe()
+            if p is None or p >= need:
+                self._awaiting_turn = False
+                if p is not None:
+                    log.debug("turn complete (p=%.2f >= %.2f after %.0fms)",
+                              p, need, ms)
+                out.append((kind, ms))
+            else:
+                log.debug("turn incomplete (p=%.2f < %.2f); still listening",
+                          p, need)
+                self._awaiting_turn = True
+                self._turn_speech_ms = ms
+                self._turn_deadline = now + self.cfg.turn_max_wait_ms / 1000.0
+                self._turn_next_probe = now + self.cfg.turn_reprobe_ms / 1000.0
+
+        # Still holding a turn open: re-ask against the (now lower) bar, or
+        # give up on the clock.
+        if self._awaiting_turn and not self._vad.active:
+            if now >= self._turn_deadline:
+                log.info("turn held %.0fms without a 'finished'; committing",
+                         self.cfg.turn_max_wait_ms)
+                self._awaiting_turn = False
+                out.append(("speech_end", self._turn_speech_ms))
+            elif now >= self._turn_next_probe:
+                silence_ms = (now - self._turn_silence_since) * 1000.0
+                need = self._turn_required_p(silence_ms)
+                p = await self._turn_probe()
+                self._turn_next_probe = now + self.cfg.turn_reprobe_ms / 1000.0
+                if p is None or p >= need:
+                    if p is not None:
+                        log.debug("turn complete (p=%.2f >= %.2f after %.0fms "
+                                  "of silence)", p, need, silence_ms)
+                    self._awaiting_turn = False
+                    out.append(("speech_end", self._turn_speech_ms))
+        return out
+
+    def _turn_required_p(self, silence_ms: float) -> float:
+        """How convincing "finished" must be, given how long they have paused.
+
+        Linear from ``turn_threshold_early`` at the trigger down to
+        ``turn_threshold`` at ``turn_relax_ms``: a snap judgement on a short
+        pause needs near-certainty, a long pause speaks for itself.
+        """
+        lo, hi = self.cfg.turn_threshold, self.cfg.turn_threshold_early
+        t0, t1 = float(self.cfg.vad_hangover_ms), float(self.cfg.turn_relax_ms)
+        if silence_ms >= t1:
+            return lo
+        if silence_ms <= t0:
+            return hi
+        return hi - (hi - lo) * (silence_ms - t0) / max(t1 - t0, 1.0)
+
     async def _process_audio(self, pcm: np.ndarray) -> None:
-        events = self._vad.push(pcm)
+        events = await self._gate_turn_end(self._vad.push(pcm))
         for kind, ms in events:
             if kind == "speech_start":
+                # New speech invalidates any transcription launched during the
+                # pause: the buffer it covered is no longer the utterance.
+                self._speech_gen += 1
                 log.debug("VAD speech_start (nf=%.0f thr=%.0f)", self._vad.noise_floor, self._vad.thr_on)
             else:
                 self._last_speech_end_wall = time.monotonic()
@@ -758,6 +896,12 @@ class ConversationBrain:
         raw = pcm.tobytes()
         started = any(k == "speech_start" for k, _ in events)
         ended = any(k == "speech_end" for k, _ in events)
+        # How much of this utterance the VAD actually judged to be speech. The
+        # filler guard in _batch_transcribe needs it to tell "the user said
+        # thanks" from "Whisper was handed silence".
+        for k, ms in events:
+            if k == "speech_end":
+                self._utterance_speech_ms = float(ms)
         if started and not self._batch_active:
             self._batch_active = True
             self._batch_buf = bytearray(self._batch_preroll)  # keep 300 ms pre-roll
@@ -774,28 +918,97 @@ class ConversationBrain:
         if len(self._batch_preroll) > preroll_cap:
             del self._batch_preroll[: len(self._batch_preroll) - preroll_cap]
 
+    # Whisper emits these verbatim when handed audio with no speech in it --
+    # an artefact of the subtitle corpora it was trained on. They arrive as
+    # perfectly ordinary-looking transcripts, so they cannot be filtered by
+    # confidence downstream; they have to be recognised here.
+    _HALLUCINATIONS = frozenset({
+        "thank you", "thank you.", "thanks for watching", "thanks for watching!",
+        "thank you for watching", "thank you for watching.", "you", "bye",
+        "bye.", "so", ".", "okay", "oh", "please subscribe", "subscribe",
+        "thanks", "thanks.", "the end", "music", "applause",
+    })
+
+    def _is_hallucination(self, text: str, speech_ms: float) -> bool:
+        """A stock Whisper filler that the user did not have time to say.
+
+        Only rejected when the VAD saw too little actual speech to account for
+        it -- someone really can answer "thank you", and if they spoke for a
+        second or more this lets it through.
+        """
+        t = " ".join(text.lower().split()).strip(" .,!?")
+        if t not in {h.strip(" .,!?") for h in self._HALLUCINATIONS}:
+            return False
+        # ~1 s of speech is far more than these fillers take to utter, so
+        # anything under it is the artefact rather than the user.
+        return speech_ms < 1000.0
+
+    async def _stt_call(self, pcm_bytes: bytes) -> dict:
+        """One Whisper pass on the leased GPU, outcome as data (never raises)."""
+        from server.gpu_session import LeaseError
+
+        try:
+            res = await asyncio.to_thread(self.proxy.stt_transcribe, pcm_bytes, SR)
+            return {"ok": True, "text": (res or {}).get("text") or ""}
+        except LeaseError:
+            return {"ok": False, "lease_lost": True}
+        except Exception as exc:
+            return {"ok": False, "err": f"{type(exc).__name__}: {exc}"}
+
+    def _launch_spec_stt(self) -> None:
+        """Start transcribing the utterance while the gate is still deciding.
+
+        Whisper is not a streaming recogniser, so the transcript cannot be
+        built up as the user talks -- but it does not have to wait for the
+        COMMIT either. The endpoint gate deliberates for 200-1200 ms after
+        speech stops, and a ~250 ms Whisper pass fits inside that window, so by
+        the time the gate says "finished" the transcript is usually already
+        done and the reply pipeline starts immediately.
+
+        Correctness: everything appended to the buffer after this launches is
+        silence (if speech resumed, the gate stopped deliberating), so the
+        snapshot covers the whole utterance. The result is valid exactly while
+        ``_speech_gen`` is unchanged; a wrong guess costs one discarded
+        inference on a lane with headroom, never a wrong transcript.
+        """
+        if self._spec_stt is not None and self._spec_stt[0] == self._speech_gen:
+            return                                    # already in flight
+        buf = bytes(self._batch_buf)
+        if len(buf) < int(0.25 * SR) * _BYTES_PER_SAMPLE:
+            return
+        self._spec_stt = (self._speech_gen,
+                          asyncio.create_task(self._stt_call(buf)))
+
     async def _batch_transcribe(self, pcm_bytes: bytes) -> None:
         """Transcribe one VAD-delimited utterance with Whisper on the leased GPU.
 
-        This replaced ElevenLabs Scribe. Batch-per-utterance rather than a
-        streaming recogniser: Whisper is not streaming, and the local VAD
-        already tells us where an utterance ends, so the added latency is one
-        transcription (~200-400 ms) after the user stops talking rather than a
-        continuously updating partial.
+        Usually the work is already done: ``_launch_spec_stt`` ran it during
+        the endpoint gate's deliberation, and this just collects the result.
+        The fresh pass only happens when the utterance committed without a
+        deliberation window (e.g. the max-utterance cap mid-speech).
         """
-        from server.gpu_session import PROXY, LeaseError
-
         if len(pcm_bytes) < int(0.25 * SR) * _BYTES_PER_SAMPLE:
             return
-        try:
-            res = await asyncio.to_thread(PROXY.stt_transcribe, pcm_bytes, SR)
-            text = (res or {}).get("text") or ""
-        except LeaseError:
-            # The GPU went away mid-utterance; the web layer is already tearing
-            # the session down, so stay quiet rather than surfacing a second error.
+        spec, self._spec_stt = self._spec_stt, None
+        if spec is not None and spec[0] == self._speech_gen:
+            res = await spec[1]
+        else:
+            if spec is not None:
+                spec[1].cancel()                     # stale guess; drop it
+            res = await self._stt_call(pcm_bytes)
+        if not res.get("ok"):
+            if res.get("lease_lost"):
+                # The GPU went away mid-utterance; the web layer is already
+                # tearing the session down, so stay quiet rather than
+                # surfacing a second error.
+                return
+            self._error(f"STT failed: {res.get('err', 'unknown')}")
             return
-        except Exception as exc:
-            self._error(f"STT failed: {type(exc).__name__}: {exc}")
+        text = res.get("text") or ""
+        speech_ms = self._utterance_speech_ms
+        if text and self._is_hallucination(text, speech_ms):
+            log.info("dropping Whisper filler %r (only %.0fms of speech)",
+                     text.strip(), speech_ms)
             return
         self._on_final_transcript(text)
 
@@ -853,7 +1066,14 @@ class ConversationBrain:
             except (asyncio.CancelledError, Exception):
                 pass
         if flush_audio:
-            self.flush_avatar_audio()
+            dropped = self.flush_avatar_audio()
+            if dropped:
+                # The text streamed to the transcript as the LLM produced it, but
+                # this audio never reached the speaker. Without saying so, the UI
+                # shows a full reply the avatar only partly spoke — which reads
+                # as the avatar saying something different from the transcript.
+                self._emit({"type": "avatar_interrupted",
+                            "dropped_seconds": round(dropped / SR, 2)})
 
     def flush_avatar_audio(self) -> int:
         """Drop all un-consumed avatar audio (barge-in). Returns samples dropped."""
@@ -990,7 +1210,7 @@ class ConversationBrain:
         spoken_parts: t.List[str] = []
         tts: t.Optional[_OmniVoiceTTS] = None
         try:
-            tts = _OmniVoiceTTS(self.cfg, self._append_avatar_pcm)
+            tts = _OmniVoiceTTS(self.cfg, self._append_avatar_pcm, self.proxy)
             open_task = asyncio.create_task(tts.open())
 
             chunker = PhraseChunker(self.cfg.tts_min_chunk_chars)
@@ -1037,6 +1257,16 @@ class ConversationBrain:
                 if speech_end:
                     m["speech_end_to_first_audio"] = fa - speech_end
             m["tts_samples"] = self._turn_audio_samples
+            # The one number a listener actually feels: how long after they stop
+            # talking before the avatar starts. Split into the stages that can
+            # be worked on separately.
+            log.info("turn #%d latency: endpoint %s | llm ttft %s | tts %s "
+                     "| mouth-open %s (gpu %.0f ms for %.1f s of audio)", seq,
+                     *[f"{m[k] * 1e3:.0f} ms" if m.get(k) is not None else "-"
+                       for k in ("t_speech_end_to_turn", "llm_ttft",
+                                 "tts_first_audio_after_first_token",
+                                 "speech_end_to_first_audio")],
+                     tts.gpu_ms if tts else 0.0, tts.audio_secs if tts else 0.0)
             if self._turn_audio_samples == 0 and spoken_parts:
                 detail = (tts.error if tts is not None else None) or "empty stream"
                 self._error(f"TTS produced no audio ({detail})")
@@ -1078,8 +1308,8 @@ class ConversationBrain:
     # every SESSION_SECONDS and the next one is a fresh fork with a fresh brain.
     # Moving the plain [{role, content}] list across is what lets the avatar
     # keep talking about what it was just talking about. Only the LLM history
-    # travels -- audio buffers, VAD state and the ElevenLabs socket are all
-    # rebuilt, and the video rollout necessarily restarts.
+    # travels -- audio buffers, VAD state and the voice prompt are rebuilt,
+    # and the video rollout necessarily restarts.
     # ---------------------------------------------------------------- #
     def export_history(self) -> t.List[dict]:
         """A copy of the LLM turn history, safe to hand to a later brain."""

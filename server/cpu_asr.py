@@ -1,26 +1,14 @@
 """Whisper transcription in a dedicated child process.
 
-Why not just call the pipeline in the web process
--------------------------------------------------
-Because it bricks every subsequent GPU lease. ZeroGPU patches
-``torch.cuda.is_available()`` to return True in the web process, so transformers
-takes a CUDA code path during generation and initialises a real CUDA context —
-after which every ``@spaces.GPU`` fork dies in ``worker_init``:
+The web process must never run torch inference: ZeroGPU patches
+``torch.cuda.is_available()`` to True there, so transformers takes a CUDA code
+path during generation and initialises a real CUDA context — after which every
+``@spaces.GPU`` fork dies in ``worker_init`` with "No CUDA GPUs are
+available" until a factory reboot. ``device="cpu"`` does not prevent it.
 
-    torch.init(nvidia_uuid) -> torch.Tensor([0]).cuda()
-    RuntimeError: No CUDA GPUs are available
-
-``device="cpu"`` does NOT prevent this. It was reproducible: upload a voice
-clip, and the next lease — and every lease after it — failed until a factory
-reboot. Sessions that never touched ``/voice`` were fine.
-
-So the rule is: **the web process must never run torch inference.** This runs it
-in a child instead, where a CUDA context (if one is created at all) is harmless
-because it belongs to a different process.
-
-The child is forked early, before the big models are built, so it inherits a
-small parent. It loads its own model once and then serves requests, which keeps
-per-request latency to the transcription itself.
+So this runs in a child process, where a CUDA context is harmless. The child
+is forked early (before the big models are built) so it inherits a small
+parent, loads its model once, and serves requests.
 """
 
 from __future__ import annotations
@@ -28,9 +16,15 @@ from __future__ import annotations
 import io
 import logging
 import multiprocessing as _mp
+import os
 import threading
 
 log = logging.getLogger("avatar.cpu_asr")
+
+# Seconds of the uploaded clip actually used. MUST match server/speech.py's
+# REF_MAX_SECS: the clone conditions on audio AND its transcript, so
+# transcribing a different span than the clone hears would mis-condition it.
+REF_MAX_SECS = float(os.environ.get("AVATAR_REF_MAX_SECS", "15"))
 
 _CTX = _mp.get_context("fork")
 
@@ -59,8 +53,8 @@ def _worker(model_name: str, req, res) -> None:
             wav = np.asarray(wav)
             if wav.ndim > 1:                    # stereo -> mono
                 wav = wav.mean(axis=1)
-            if wav.shape[0] > 30 * sr:          # more than this is pointless
-                wav = wav[: 30 * sr]
+            if wav.shape[0] > REF_MAX_SECS * sr:
+                wav = wav[: int(REF_MAX_SECS * sr)]
             out = pipe({"array": wav, "sampling_rate": int(sr)})
             res.put((True, (out or {}).get("text", "").strip()))
         except Exception as exc:

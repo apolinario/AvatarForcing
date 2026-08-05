@@ -1,28 +1,14 @@
-"""OmniVoice TTS + Whisper STT, running inside the ZeroGPU worker.
+"""OmniVoice TTS + Whisper STT, running inside the GPU worker.
 
-Replaces ElevenLabs on both sides of the conversation: `k2-fsa/OmniVoice` for
-speech synthesis (zero-shot voice cloning) and the Whisper model it ships with
-for transcription. Both run on the leased GPU, alongside the avatar engine.
+OmniVoice is a masked diffusion LM: it predicts the output duration up front
+and denoises the whole token sequence over ``num_step`` parallel passes, so no
+audio exists until the final step and there is nothing to stream below chunk
+granularity. Synthesis is therefore phrase-at-a-time — the same granularity
+the conversation brain produces as LLM tokens arrive.
 
-Why phrase-at-a-time
---------------------
-OmniVoice is a masked diffusion LM, not an autoregressive one: it predicts the
-output duration up front and denoises a fixed-length token sequence over
-`num_step` parallel passes, so there is no incremental decode to stream from —
-the audio does not exist until the final step. What it *does* support is
-chunking: `_generate_chunked` splits text at punctuation and generates chunk by
-chunk. This module drives that loop from outside, one phrase per call, which is
-exactly the granularity the conversation brain already produces as LLM tokens
-arrive. Streaming therefore happens at phrase level, not sample level.
-
-Budget (measured on a 48 GB half-MIG, `num_step=32`)
----------------------------------------------------
-RTF ~0.23, i.e. a 3 s phrase costs ~740 ms of GPU. The avatar engine already
-uses ~220 ms of every 400 ms block, so a phrase lands as a burst that overruns a
-single block rather than a steady load. That is survivable because synthesis
-runs ~4x faster than playback and stays ahead of the buffer, and because the web
-layer re-baselines its clock rather than accumulating debt — but it is the
-reason PHRASE_TARGET_SECS is kept low: smaller chunks mean smaller bursts.
+Budget: RTF ~0.23 at ``num_step=32`` (a 3 s phrase costs ~740 ms of GPU),
+sharing the card with an avatar engine that uses ~220 ms of every 400 ms
+block. Short phrases keep each burst inside what the block loop absorbs.
 """
 
 from __future__ import annotations
@@ -37,8 +23,7 @@ import torch   # module scope is safe: this module is only imported in the worke
 
 log = logging.getLogger("avatar.speech")
 
-# Matches the official k2-fsa/OmniVoice demo Space, so quality here is the
-# quality people have already heard.
+# Same settings as the official k2-fsa/OmniVoice demo.
 NUM_STEP = 32
 GUIDANCE_SCALE = 2.0
 
@@ -53,6 +38,13 @@ WIRE_SR = 16000         # the avatar protocol / engine sample rate
 # driven (chunk_text_punctuation will not break below min_chunk_len), so this is
 # an upper bound, not a guarantee -- a single long clause still generates whole.
 PHRASE_TARGET_SECS = 1.5
+
+# Seconds of the uploaded reference clip used for the clone. Must match
+# server/cpu_asr.py's REF_MAX_SECS: the transcript is produced from the first
+# REF_MAX_SECS, so cloning from a longer span would pair audio with text that
+# does not describe it. (OmniVoice trims at 20 s of its own accord; this is
+# tighter and, crucially, agrees with the transcriber.)
+REF_MAX_SECS = float(os.environ.get("AVATAR_REF_MAX_SECS", "15"))
 
 # Silence padding is disabled so consecutive phrases butt together without a
 # gap; a short fade still runs to keep the joins from clicking.
@@ -74,14 +66,11 @@ def _to_wire_pcm(audio_f32: np.ndarray) -> bytes:
 class PaddedAOTI:
     """Pad the sequence into the compiled graph's shape class, then slice back.
 
-    Export specialised on `seq % 8 == 6` (the model pads its sequence to a
-    multiple of the 8 codebooks, so the modulo is baked into the graph). Real
-    phrases land on any residue — seq=206 works, seq=483 gives
-    "size of tensor a (325) must match tensor b (330)" because the compiled
-    graph returns logits for a different length than the caller expects.
-
-    Rather than compile one artifact per residue, pad up to the next conforming
-    length (at most 7 positions), run, and slice the answer back. The padded
+    The export specialised on ``seq % 8 == 6`` (the model pads its sequence to
+    a multiple of the 8 codebooks, so the modulo is baked into the graph), but
+    real phrases land on any residue. Rather than compile one artifact per
+    residue, pad up to the next conforming length (at most 7 positions), run,
+    and slice the answer back. The padded
     positions are masked out of attention in BOTH directions, so no real
     position can attend to them and the real logits are unchanged.
     """
@@ -135,11 +124,10 @@ class PaddedAOTI:
 def aoti_loader(module, package_dir):
     """Supply weights INCLUDING non-persistent buffers, under both spellings.
 
-    spaces' default loader feeds the artifact `module.state_dict()`, which omits
-    non-persistent buffers — and the rotary cache is one, so loading warned
-    "Found constant ... llm_rotary_emb_inv_freq ... but not provided by user".
-    named_buffers() has it. The artifact also refers to constants by a
-    dot-flattened name, so both spellings go in and the extra keys are ignored.
+    ``state_dict()`` omits non-persistent buffers (the rotary cache is one);
+    ``named_buffers()`` has them. The artifact refers to constants both by
+    dotted and underscore-flattened names, so both spellings go in and the
+    extra keys are ignored.
     """
     from pathlib import Path
 
@@ -160,18 +148,16 @@ class Speech:
 
     def __init__(self, model, asr_model=None, asr_processor=None) -> None:
         self.model = model
-        # AoTI is bound at import in app.py, not here: it is all CPU work, and
-        # doing it in the lease cost 23.7 s of the visitor's session. Whether it
-        # took is simply whether the forward is our wrapper.
+        # AoTI is bound at import in app.py (CPU-only work that must not run on
+        # the visitor's lease); whether it took is whether forward is wrapped.
         self.aoti = isinstance(getattr(model, "forward", None), PaddedAOTI)
         self._prompt = None          # cached VoiceClonePrompt for this session
         self._voice_key: str | None = None
 
-        # The ASR *weights* were loaded and packed at import; only the pipeline
-        # object is assembled here. That split is the whole point: building a
-        # transformers pipeline in the web process initialises CUDA there and
-        # poisons the fork ("No CUDA GPUs are available" in worker_init).
-        # Moving weights with .to("cuda") is fine — ZeroGPU intercepts that.
+        # ASR weights were loaded and packed at import; only the pipeline
+        # object is assembled here. Building a transformers pipeline in the web
+        # process would initialise CUDA there and poison every later fork;
+        # moving weights with .to("cuda") is fine (ZeroGPU intercepts it).
         if asr_model is not None and asr_processor is not None:
             t0 = time.perf_counter()
             try:
@@ -226,16 +212,21 @@ class Speech:
         wav = np.asarray(wav)
         if wav.ndim > 1:                     # stereo -> mono
             wav = wav.mean(axis=1)
-        # A very long reference wastes prompt budget; OmniVoice itself trims
-        # above 20 s, so cut here to keep the transcription cheap too.
-        if wav.shape[0] > 20 * sr:
-            wav = wav[: 20 * sr]
+        if wav.shape[0] > REF_MAX_SECS * sr:
+            wav = wav[: int(REF_MAX_SECS * sr)]
 
         text = (ref_text or "").strip()
         if not text:
             text = self.transcribe_array(wav, sr)
             log.info("reference clip auto-transcribed: %d chars", len(text))
 
+        # Record exactly what conditions the clone (presets and uploads reach
+        # here by different routes).
+        import hashlib
+        log.info("clone inputs: %.1fs @%dHz sha=%s ref_text(%d)=%r",
+                 wav.shape[0] / sr, int(sr),
+                 hashlib.sha1(wav.tobytes()).hexdigest()[:10],
+                 len(text), text[:120])
         self._prompt = self.model.create_voice_clone_prompt(
             (torch.from_numpy(wav)[None], int(sr)), ref_text=text or None)
         self._voice_key = key or None
@@ -285,9 +276,8 @@ class Speech:
         """
         from omnivoice.utils.text import chunk_text_punctuation
 
-        # The library measures chunk length in characters against an estimated
-        # frame rate; ~15 chars/second of speech is the rate its own default
-        # (15 s chunks) implies, and matches what we measured.
+        # ~15 chars per second of speech, the rate the library's own default
+        # implies.
         chunk_len = max(24, int(PHRASE_TARGET_SECS * 15))
         try:
             return [c for c in chunk_text_punctuation(

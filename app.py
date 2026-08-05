@@ -21,9 +21,10 @@ log = logging.getLogger("app")
 
 PORT   = int(os.environ.get("PORT", "7860"))
 HOST   = os.environ.get("HOST", "0.0.0.0")
-# Defaults to the reference portrait that ships with this repo. Point
-# AVATAR_REF_IMAGE at your own photo (or upload one in the UI) to change it.
-REF    = os.environ.get("AVATAR_REF_IMAGE", os.path.join(HERE, "data", "rumi.jpg"))
+# The default avatar, used when a client sends no reference of its own. The UI
+# preselects the same portrait, so this only matters for API-style callers.
+REF    = os.environ.get("AVATAR_REF_IMAGE",
+                        os.path.join(HERE, "static", "presets", "pearl.jpg"))
 # The streaming server lives inside the model repo, so the repo root is HERE.
 REPO   = os.environ.get("AVATAR_REPO_DIR", HERE)
 DEVICE = os.environ.get("AVATAR_DEVICE", "cuda")
@@ -99,10 +100,11 @@ def ensure_weights() -> None:
         log.info("fetched wav2vec2-base-960h in %.1f s", time.perf_counter() - t0)
 
 
-if FETCH:                                   # AVATAR_FETCH_WEIGHTS=0 for mock / offline runs
+if FETCH:                                   # AVATAR_FETCH_WEIGHTS=0 for offline runs
     ensure_weights()
 
 from server.conversation import DEFAULT_SYSTEM_PROMPT, ConversationBrain
+from server.turn_detect import DETECTOR as TURN_DETECTOR
 from server.cpu_asr import CPUTranscriber
 from server.engine import AvatarEngine, FaceCropper
 from server.web import build_app
@@ -118,6 +120,18 @@ from server.web import build_app
 # --------------------------------------------------------------------------- #
 CPU_ASR_REPO = os.environ.get("WHISPER_CPU_REPO", "openai/whisper-small")
 _CPU_ASR = CPUTranscriber(CPU_ASR_REPO) if FETCH else None
+
+# --------------------------------------------------------------------------- #
+# semantic end-of-turn (server/turn_detect.py)
+#
+# Loaded here so the first person to pause does not pay for the download and the
+# session build. Safe in this process precisely because it is onnxruntime and
+# not torch: it never touches the CUDA that the comment above warns about.
+# --------------------------------------------------------------------------- #
+if FETCH:
+    t0 = time.perf_counter()
+    if TURN_DETECTOR.load():
+        log.info("smart-turn ready in %.1f s", time.perf_counter() - t0)
 
 # --------------------------------------------------------------------------- #
 # module-scope weight load (ZeroGPU packing)
@@ -143,7 +157,7 @@ if FETCH:
 
 
 # --------------------------------------------------------------------------- #
-# OmniVoice (TTS) + its Whisper pipe (STT), replacing ElevenLabs
+# OmniVoice (TTS) + Whisper (STT)
 #
 # Built at module scope for the same reason as the avatar engine: ZeroGPU
 # intercepts the move to "cuda" here and packs the weights (~2.0 GB), so the
@@ -153,10 +167,9 @@ if FETCH:
 # There are deliberately TWO Whisper models, on different devices, because the
 # two transcription jobs have opposite constraints:
 #
-#   * LIVE STT runs once per user utterance and the reply waits on it, so it has
-#     to be fast -> large-v3-turbo on the GPU (~200-300 ms), packed with
-#     everything else. On the Space's 2 vCPU it would take *seconds*, which is
-#     not a conversation.
+#   * LIVE STT runs once per user utterance and the reply waits on it, so it
+#     has to be fast -> large-v3-turbo on the GPU (~200-300 ms), packed with
+#     everything else.
 #   * The UPLOADED VOICE CLIP is transcribed once, before any lease exists, only
 #     to condition the voice clone -> a small model on the CPU is plenty, and
 #     running it here means the visitor spends no GPU quota to see the
@@ -200,26 +213,41 @@ if FETCH:
 # Pay AoTI's fixed start-up costs HERE, in the web process, so they do not come
 # out of the visitor's 90 s session.
 #
-#  * valid_vec_isa_list() compiles a small CPU probe to detect the vector ISA.
-#    spaces calls it from LazyAOTIModel.__init__, and it was the bulk of a
-#    23.7 s in-lease "AoTI load". It is CPU-only, so it is safe here, and the
-#    fork inherits the cached result.
+#  * valid_vec_isa_list() compiles a small CPU probe to detect the vector ISA
+#    (tens of seconds). It is CPU-only, so it is safe here, and the fork
+#    inherits the cached result.
 #  * the package itself is a couple of MB; fetching it now means the lease only
 #    maps it.
 # --------------------------------------------------------------------------- #
 AOTI_REPO = os.environ.get("OMNIVOICE_AOTI_REPO", "multimodalart/omnivoice-aoti")
+
+# The same treatment for the avatar engine's stateless leaves (decode, user
+# motion encode, audio encode) -- see server/aoti.py for what is compiled and
+# why step() itself cannot be. Defaults to OFF: set
+# AVATARFORCING_AOTI_REPO=multimodalart/avatarforcing-aoti to switch it on.
+# Empty means the engine runs exactly as before, with this block skipped.
+AVATAR_AOTI_REPO = os.environ.get("AVATARFORCING_AOTI_REPO", "")
+
+if FETCH and AVATAR_AOTI_REPO and _ENGINE.G is not None:
+    from server.aoti import aoti_loader as _avatar_aoti_loader
+
+    t0 = time.perf_counter()
+    try:
+        spaces.aoti_load(_ENGINE.G, repo_id=AVATAR_AOTI_REPO,
+                         aoti_loader=_avatar_aoti_loader)
+        log.info("avatar AoTI package bound in %.1f s", time.perf_counter() - t0)
+    except Exception:
+        log.exception("avatar AoTI bind failed -- the engine will run eager")
 
 if FETCH and AOTI_REPO and _TTS is not None:
     from server.speech import aoti_loader
 
     t0 = time.perf_counter()
     try:
-        # All of this is CPU work: download the package, compile the inductor
-        # vec-ISA probe, and bind the artifact to the module's parameter
-        # tensors. The binding holds REFERENCES to those tensors, and ZeroGPU's
-        # unpacking rebinds their .data to real VRAM in the worker -- so the
-        # weights the artifact sees are the restored ones, with nothing
-        # re-transferred. Doing it in the lease cost 23.7 s of the session.
+        # CPU work only: download, vec-ISA probe, and binding the artifact to
+        # the module's parameter tensors. The binding holds REFERENCES, and
+        # ZeroGPU's unpacking rebinds their .data to real VRAM in the worker,
+        # so the artifact sees the restored weights with nothing re-sent.
         spaces.aoti_load(_TTS, repo_id=AOTI_REPO, aoti_loader=aoti_loader)
         log.info("AoTI package bound in %.1f s", time.perf_counter() - t0)
     except Exception:
@@ -232,15 +260,16 @@ def speech_factory():
     return Speech(_TTS, asr_model=_ASR_MODEL, asr_processor=_ASR_PROC)
 
 
-def brain_factory(on_event, cfg):
+def brain_factory(on_event, cfg, proxy=None):
     """One brain per WS session, carrying that session's UI overrides.
 
-    The voice itself is no longer the brain's business: the clip is cloned into
-    the GPU worker by the web layer before priming, and the brain just asks it
-    to speak. ``cfg["system_prompt"]`` falsy -> the built-in prompt.
+    The voice clip is cloned into the GPU worker by the web layer before
+    priming; the brain just asks it to speak. ``cfg["system_prompt"]`` falsy ->
+    the built-in prompt.
     """
     return ConversationBrain(
         on_event,
+        proxy=proxy,
         use_vision=VISION,
         system_prompt=cfg.get("system_prompt") or DEFAULT_SYSTEM_PROMPT,
     )

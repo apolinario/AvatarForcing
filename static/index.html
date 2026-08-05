@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
-<title>Live Avatar — real-time conversation</title>
+<title>Real Avatar Streaming</title>
 <style>
   /* Design language lifted from apolinar.io: Helvetica, #f6f6f6 paper, 2px black
      rules, hard offset shadows (no blur, no radius), one yellow highlight. */
@@ -41,8 +41,10 @@
   .title h1{margin:0;font-size:3em;line-height:1.05;font-weight:300;letter-spacing:-.01em}
   .title p{
     margin:.4em 0 0;color:var(--ink-2);font-family:var(--mono);
-    font-size:.95em;letter-spacing:.05em;
+    font-size:.85em;letter-spacing:.04em;
   }
+  .title p a{color:var(--ink);border-bottom:1px solid var(--ink-3)}
+  .title p a:hover{background:var(--hi);border-bottom-color:var(--ink)}
   .spacer{flex:1}
 
   /* ---------------- status chip ---------------- */
@@ -94,6 +96,9 @@
   }
   .thumb.on{display:block}
   .hint{font-size:.8em;color:var(--ink-3);font-family:var(--mono)}
+  /* Everything after this point was written but never spoken. */
+  .cut{font-family:var(--mono);font-size:.78em;color:var(--alert);opacity:.75}
+  [data-cut] { opacity:.72 }
 
   /* ---------------- buttons ---------------- */
   .button{
@@ -111,9 +116,50 @@
   .button.stop{background:var(--hi);color:var(--ink)}
   .button.stop:hover{background:var(--paper)}
   .button[disabled]{opacity:.4;pointer-events:none;box-shadow:none}
+  /* Discard control. Deliberately small and a muted brick red rather than the
+     alert red: removing a portrait is reversible and shouldn't read as a
+     warning. */
+  .clearx{
+    color:#b4524a;font-size:1.15em;line-height:1;font-weight:400;
+    padding:.15ex .7ex;min-width:0;
+  }
+  .clearx:hover,.clearx:focus{background:#b4524a;color:var(--paper);border-color:#b4524a}
+  .clearx[hidden]{display:none}
   .button[aria-pressed="true"]{background:var(--hi)}
   .button svg{width:1.05em;height:1.05em;flex:none}
   .controls{display:flex;gap:.6em;align-items:center;margin-top:1.2em}
+  /* Built-in avatars: a row of plain squares, nothing else. The name lives in
+     the tooltip so hovering still tells you who it is without adding chrome. */
+  .presets{margin:.2em 0 1.1em}
+  .preset-row{display:flex;gap:.5em;flex-wrap:wrap}
+  .preset{
+    cursor:pointer;padding:0;width:3.2em;height:3.2em;overflow:hidden;
+    background:var(--paper);border:var(--border);box-shadow:var(--shadow);
+    transition:box-shadow .12s ease,transform .12s ease;
+  }
+  .preset img{width:100%;height:100%;object-fit:cover;display:block}
+  .preset:hover{box-shadow:var(--shadow-lg)}
+  .preset:active{box-shadow:none;transform:translate(.3ex,.3ex)}
+  .preset[aria-pressed="true"]{
+    box-shadow:var(--shadow-lg);outline:.4ex solid var(--hi);outline-offset:-.4ex;
+  }
+  .preset[disabled]{opacity:.5;pointer-events:none}
+
+  /* Hero start button: full page width, above both columns, first run only. */
+  .hero{margin:0 0 2em}
+  .hero-btn{width:100%;padding:1.1ex 1ex;font-size:1.15em;margin:0}
+  /* Retiring it: slide toward the in-column controls and fade, then collapse
+     the space it occupied so the grid closes up smoothly rather than jumping.
+     --dy is measured at click time (see retireHero) so it lands where the stop
+     button actually is, whatever the viewport. */
+  .hero.retiring{
+    transition:transform .45s cubic-bezier(.4,0,.2,1),opacity .35s ease,
+               margin-bottom .45s cubic-bezier(.4,0,.2,1),
+               max-height .45s cubic-bezier(.4,0,.2,1);
+    transform:translateY(var(--dy,120px)) scale(.97);
+    opacity:0;max-height:0;margin-bottom:0;overflow:hidden;pointer-events:none;
+  }
+  .hero[hidden]{display:none}
   .controls .primary{flex:1;padding:.8ex 1ex}
 
   /* ---------------- layout ---------------- */
@@ -278,8 +324,12 @@
 
 <header>
   <div class="title">
-    <h1>Live Avatar</h1>
-    <p>real-time conversational video</p>
+    <h1>Real Avatar Streaming</h1>
+    <p>fully open source real time avatar streaming ·
+      <a href="https://github.com/apolinario/AvatarForcing" target="_blank" rel="noopener">code</a> ·
+      <a href="https://huggingface.co/multimodalart/AvatarForcingHelpers" target="_blank" rel="noopener">avatar model</a> ·
+      <a href="https://huggingface.co/k2-fsa/OmniVoice" target="_blank" rel="noopener">TTS model</a>
+    </p>
   </div>
   <div class="spacer"></div>
   <div class="pill" id="pill" data-s="offline" role="status" aria-live="polite">
@@ -291,6 +341,13 @@
   <div class="lease" id="lease" hidden><span id="leaseText"></span></div>
 </header>
 
+<!-- Built-in avatars. Selecting one fetches its portrait and voice clip and
+     feeds them through exactly the same path a manual upload uses, so there is
+     no preset-specific protocol -- only a different source for the bytes. -->
+<div class="presets" id="presets" hidden>
+  <div class="preset-row" id="presetRow"></div>
+</div>
+
 <div class="setup">
   <div class="field">
     <span class="lbl">Reference photo</span>
@@ -298,7 +355,8 @@
       <input type="file" id="refInput" accept="image/*" />
       <button class="button" id="refBtn" type="button">Choose a portrait…</button>
       <img class="thumb" id="refThumb" alt="" />
-      <button class="button" id="refClear" type="button" style="display:none">Reset</button>
+      <button class="button clearx" id="refClear" type="button"
+              title="Remove this portrait" aria-label="Remove this portrait" hidden>&times;</button>
       <span class="hint" id="refName">default face</span>
     </div>
   </div>
@@ -307,15 +365,27 @@
     <div class="row">
       <input type="file" id="voiceInput" accept="audio/*" />
       <button class="button" id="voiceBtn" type="button">Upload a clip</button>
-      <button class="button" id="voiceClear" type="button" hidden>Clear</button>
+      <button class="button clearx" id="voiceClear" type="button"
+              title="Remove this voice" aria-label="Remove this voice" hidden>&times;</button>
       <span class="hint" id="voiceName">default voice</span>
     </div>
     <!-- Transcribed on upload (CPU, no GPU quota) because OmniVoice clones the
-         voice from audio + its transcript. Editable: a wrong word in here
-         degrades the clone. -->
-    <input type="text" id="voiceText" autocomplete="off" spellcheck="false"
-           placeholder="transcript of the clip — filled in automatically" hidden />
+         voice from audio + its transcript. Kept in the DOM and still sent with
+         session_config -- only the input is hidden, so the clone still gets its
+         transcript. -->
+    <input type="hidden" id="voiceText" />
   </div>
+</div>
+
+<!-- First run only: a full-width call to action above both columns. It hands
+     over to the in-column controls once a session has been started, so the
+     layout settles into its steady state instead of keeping a button that is
+     only ever pressed once. -->
+<div class="hero" id="hero">
+  <button class="button primary hero-btn" id="heroBtn" type="button">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round"><path d="M23 7l-7 5 7 5V7z"/><rect x="1" y="5" width="15" height="14" rx="2"/></svg>
+    <span>Start session</span>
+  </button>
 </div>
 
 <main>
@@ -375,7 +445,6 @@
                 aria-controls="transcript" type="button">Transcript</button>
         <button class="tab" id="tabPrompt" role="tab" aria-selected="false"
                 aria-controls="promptPane" type="button">Sys prompt</button>
-        <span class="meta" id="turnCount">0 turns</span>
         <button class="headbtn" id="clearBtn" type="button" disabled
                 aria-label="Clear the transcript display"
                 title="Clears the display only — the avatar still remembers the conversation">Clear</button>
@@ -443,7 +512,7 @@ const FPS = 25, SR = 16000, BLOCK_FRAMES = 10;
 const BLOCK_SEC = BLOCK_FRAMES / FPS;      // 0.400 s
 const JITTER = 0.80;                       // playback jitter buffer (s)
 const MIC_CHUNK = 1600;                    // 100 ms @ 16 kHz
-const CAM_SIZE = 384, CAM_Q = 0.6, CAM_FPS = 25;
+const CAM_SIZE = 448, CAM_Q = 0.75, CAM_FPS = 25;  // motion condition: worth the bytes
 const UP_BACKPRESSURE = 3 * 1024 * 1024;   // drop cam frames above this
 // Reference upload: the server face-crops to 512 anyway, so 1024 px is already
 // generous; keeps the one-shot 0x03 frame around 150-250 KB.
@@ -452,9 +521,10 @@ const REF_MAX = 1024, REF_Q = 0.9;
 const $ = (id) => document.getElementById(id);
 const els = {};
 ["pill","pillText","lease","leaseText","ovActions","ovContinue","ovRestart",
+ "hero","heroBtn","presets","presetRow",
  "stage","avatar","overlay","ovTitle","ovText","ovIcon","pip","pipTag",
  "webcam","stagebar","micBar","clockLbl","startBtn","startLbl","muteBtn","transcript",
- "emptyState","turnCount","dBlocks","dFps","dBuf","dUnder","dUp","dDown","dMic","dRtt",
+ "emptyState","dBlocks","dFps","dBuf","dUnder","dUp","dDown","dMic","dRtt",
  "verLbl","refInput","refBtn","refThumb","refClear","refName",
  "voiceInput","voiceBtn","voiceClear","voiceName","voiceText",
  "tabTranscript","tabPrompt","promptPane","promptBox","promptReset","promptNote","clearBtn"]
@@ -473,12 +543,25 @@ const S = {
   curAvatarBubble:null, curPartial:null, turns:0, sessionStarted:0,
   refBytes:null, refURL:null,   // re-encoded reference upload (null = server default)
   voiceBytes:null,              // uploaded voice clip (null = OmniVoice default voice)
+  presetReady:null,             // in-flight load of the default preset's assets
+  transcribing:null,            // in-flight POST /voice for an uploaded clip
   defaultPrompt:"", promptDirty:false, sentPrompt:null,
+  // Who put the current text in the prompt box: "default" | "preset" | "user".
+  // Decides what happens to it when the avatar is replaced: a preset PERSONA
+  // belongs to the preset's face and leaves with it, a prompt the user typed
+  // is theirs and stays until they change it.
+  promptSource:"default",
   leaseJob:null, leaseOver:false,   // the /run_session job holding the ZeroGPU worker
+  everStarted:false,                // hero start is a first-run affordance only
   resume:false,                     // carry the conversation into the next lease
 };
 // Filled in from the lease's `ready` message; only used for wording.
 let LEASE_HINT = "a while";
+// A refused lease means another session holds the single GPU worker, not that
+// anything is wrong — wait it out rather than making the visitor re-press Start.
+// Bounded at ~50 s total: the Start button is disabled while we wait, so a
+// longer queue would trap the visitor with their camera on for no good reason.
+const LEASE_BUSY_RETRIES = 5, LEASE_BUSY_DELAY_MS = 10000;
 
 /* ---------------------------------------------------------------- status --- */
 const LABEL = { offline:"Offline", connecting:"Connecting…", ready:"Ready",
@@ -522,7 +605,6 @@ function clearTranscript(){
   S.curPartial = null;
   S.curAvatarBubble = null;
   S.turns = 0;
-  els.turnCount.textContent = "0 turns";
   updateClearState();
 }
 els.clearBtn.addEventListener("click", clearTranscript);
@@ -555,9 +637,22 @@ function onUserTranscript(text, final){
   } else bubble("user", "you", text);
   S.curPartial = null;
   S.curAvatarBubble = null;
-  S.turns++;
-  els.turnCount.textContent = S.turns + (S.turns === 1 ? " turn" : " turns");
+  S.turns++;   // still tracked for /healthz-style debugging, just not displayed
 }
+/* The transcript streams the LLM's text as it arrives, but a barge-in discards
+   whatever audio had not been played yet. Marking the bubble keeps what you read
+   honest about what you heard. */
+function markInterrupted(){
+  const b = S.curAvatarBubble && S.curAvatarBubble.b;
+  if (!b || b.dataset.cut) return;
+  b.dataset.cut = "1";
+  const tail = document.createElement("span");
+  tail.className = "cut";
+  tail.textContent = " — interrupted";
+  b.appendChild(tail);
+  S.curAvatarBubble = null;          // the next reply opens a fresh bubble
+}
+
 function onAvatarText(chunk){
   if (!S.curAvatarBubble) S.curAvatarBubble = bubble("avatar", "avatar", "");
   S.curAvatarBubble.b.textContent += chunk;
@@ -583,32 +678,147 @@ async function prepareReference(file){
   return { bytes: await blob.arrayBuffer(), url: URL.createObjectURL(blob) };
 }
 function clearReference(){
+  clearPresetSelection();
   if (S.refURL) URL.revokeObjectURL(S.refURL);
   S.refBytes = null; S.refURL = null;
   els.refInput.value = "";
   els.refThumb.classList.remove("on");
   els.refThumb.removeAttribute("src");
-  els.refClear.style.display = "none";
+  els.refClear.hidden = true;
   els.refName.textContent = "default face";
 }
+/* ----- built-in avatars ------------------------------------------------- */
+/* A preset is just a pre-packaged version of what the two upload fields do:
+   fetch the portrait and the clip as bytes, set the transcript and the system
+   prompt, and let the existing session_config path carry them. Nothing about
+   the wire protocol knows presets exist. */
+async function applyPreset(p, btn){
+  for (const b of els.presetRow.querySelectorAll(".preset"))
+    b.setAttribute("aria-pressed", String(b === btn));
+  btn.disabled = true;
+  try {
+    // no-store: these bytes BECOME the clone reference, so a stale cached copy
+    // is not a slow page, it is the wrong voice. The manifest also hashes the
+    // file content into the URL, so either mechanism alone would suffice.
+    const grab = (u) => fetch(new URL(u, window.location.href), { cache:"no-store" })
+      .then(r => { if (!r.ok) throw new Error("asset " + r.status); return r.arrayBuffer(); });
+    const [img, wav] = await Promise.all([grab(p.image), grab(p.voice)]);
+    S.refBytes = new Uint8Array(img);
+    S.voiceBytes = new Uint8Array(wav);
+    if (S.refURL) URL.revokeObjectURL(S.refURL);
+    S.refURL = URL.createObjectURL(new Blob([S.refBytes], { type:"image/jpeg" }));
+    els.refThumb.src = S.refURL;
+    els.refThumb.classList.add("on");
+    els.refClear.hidden = false;
+    els.refName.textContent = Math.round(S.refBytes.byteLength / 1024) + " KB";
+    els.voiceText.value = p.ref_text || "";
+    els.voiceClear.hidden = false;
+    els.voiceName.textContent = "voice ready";
+    // The personality goes in the prompt box so it stays visible and editable
+    // rather than being applied invisibly.
+    els.promptBox.value = p.system_prompt || "";
+    S.promptDirty = true;
+    S.promptSource = "preset";
+    updatePromptNote();
+  } catch (e){
+    els.refName.textContent = "could not load that avatar";
+    btn.setAttribute("aria-pressed", "false");
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+fetch(new URL("./presets", window.location.href), { cache:"no-store" })
+  .then(r => r.json())
+  .then(j => {
+    const list = (j && j.presets) || [];
+    if (!list.length) return;
+    let defaultBtn = null;
+    for (const p of list){
+      const b = document.createElement("button");
+      b.className = "preset";
+      b.type = "button";
+      b.setAttribute("aria-pressed", "false");
+      b.title = p.note ? `${p.label} — ${p.note}` : p.label;
+      b.setAttribute("aria-label", p.label);
+      const im = document.createElement("img");
+      im.src = new URL(p.image, window.location.href).href;
+      im.alt = p.label;
+      im.loading = "lazy";
+      b.appendChild(im);
+      b.addEventListener("click", () => applyPreset(p, b));
+      els.presetRow.appendChild(b);
+      if (p.default) defaultBtn = [p, b];
+    }
+    els.presets.hidden = false;
+    // Selected for them, not just suggested: the portrait, the voice and the
+    // personality all travel together, so a half-applied default would be worse
+    // than none.
+    // Kept as a promise that startSession() awaits: starting before these
+    // fetches land would silently fall back to the model's default voice.
+    if (defaultBtn) S.presetReady = applyPreset(defaultBtn[0], defaultBtn[1]);
+  })
+  .catch(() => {});
+
 /* ----- voice clip: upload, transcribe on the server's CPU, keep both ----- */
+function clearPresetSelection(){
+  for (const b of els.presetRow.querySelectorAll(".preset"))
+    b.setAttribute("aria-pressed", "false");
+}
+
+/* While an uploaded clip is being transcribed, starting a session would pair
+   the new audio with whatever transcript is still in the box (right after page
+   load: the default preset's sentence), mis-conditioning the clone. So the
+   start buttons wait, and say why. */
+const START_WAIT_MSG = "waiting for the audio transcription";
+let _waitTimer = null;
+function setStartWait(on){
+  const heroSpan = els.heroBtn.querySelector("span");
+  if (on){
+    els.startBtn.disabled = true;
+    els.heroBtn.disabled = true;
+    let dots = 0;
+    const tick = () => {
+      const label = START_WAIT_MSG + " " + ". ".repeat(1 + (dots++ % 3)).trim();
+      els.startLbl.textContent = label;
+      if (heroSpan) heroSpan.textContent = label;
+    };
+    tick();
+    _waitTimer = setInterval(tick, 400);
+  } else {
+    clearInterval(_waitTimer); _waitTimer = null;
+    els.startBtn.disabled = S.running ? els.startBtn.disabled : false;
+    els.heroBtn.disabled = false;
+    els.startLbl.textContent = S.running ? "Stop" : "Start session";
+    if (heroSpan) heroSpan.textContent = "Start session";
+  }
+}
+
 function clearVoice(){
+  clearPresetSelection();
   S.voiceBytes = null;
   els.voiceInput.value = "";
   els.voiceText.value = "";
-  els.voiceText.hidden = true;
   els.voiceClear.hidden = true;
   els.voiceName.textContent = "default voice";
 }
 els.voiceBtn.addEventListener("click", () => els.voiceInput.click());
 els.voiceClear.addEventListener("click", clearVoice);
 els.voiceInput.addEventListener("change", async () => {
+  clearPresetSelection();
   const file = els.voiceInput.files && els.voiceInput.files[0];
   if (!file) return;
   const buf = new Uint8Array(await file.arrayBuffer());
   S.voiceBytes = buf;
+  // The box may still hold the previous voice's sentence (on a fresh page:
+  // the default preset's). The clone conditions on audio AND transcript, so
+  // that pairing must never survive into a session.
+  els.voiceText.value = "";
   els.voiceClear.hidden = false;
-  els.voiceName.textContent = file.name.slice(0, 28) + " · transcribing…";
+  els.voiceName.textContent = "transcribing…";
+  setStartWait(true);
+  let resolveDone;
+  S.transcribing = new Promise((r) => { resolveDone = r; });
   // POST /voice runs Whisper on the server's CPU, before any GPU lease exists,
   // so seeing the transcript costs the visitor no quota. OmniVoice clones from
   // audio + transcript, so a wrong word here degrades the clone — hence the
@@ -617,21 +827,34 @@ els.voiceInput.addEventListener("change", async () => {
     const r = await fetch(new URL("./voice", window.location.href),
                           { method:"POST", body:buf });
     const j = await r.json();
-    els.voiceText.hidden = false;
     els.voiceText.value = (j && j.text) || "";
-    els.voiceName.textContent = file.name.slice(0, 28) +
-      (j && j.ok ? "" : " · transcription failed, type it in");
+    els.voiceName.textContent = (j && j.ok)
+      ? "voice ready"
+      : "could not transcribe — type what the clip says";
   } catch (e){
-    els.voiceText.hidden = false;
-    els.voiceName.textContent = file.name.slice(0, 28) + " · type the transcript";
+    els.voiceName.textContent = "could not transcribe — type what the clip says";
+  } finally {
+    S.transcribing = null;
+    setStartWait(false);
+    resolveDone();
   }
 });
 
 els.refBtn.addEventListener("click", () => els.refInput.click());
 els.refClear.addEventListener("click", clearReference);
 els.refInput.addEventListener("change", async () => {
+  clearPresetSelection();
   const file = els.refInput.files && els.refInput.files[0];
   if (!file) return;
+  // A preset's persona belongs to the preset's face, so a custom portrait
+  // reverts a preset-sourced prompt to the default. A prompt the user typed is
+  // theirs and survives avatar swaps.
+  if (S.promptSource === "preset"){
+    els.promptBox.value = S.defaultPrompt;
+    S.promptDirty = false;
+    S.promptSource = "default";
+    updatePromptNote();
+  }
   els.refName.textContent = "reading…";
   try {
     const out = await prepareReference(file);
@@ -639,7 +862,7 @@ els.refInput.addEventListener("change", async () => {
     S.refBytes = out.bytes; S.refURL = out.url;
     els.refThumb.src = out.url;
     els.refThumb.classList.add("on");
-    els.refClear.style.display = "";
+    els.refClear.hidden = false;
     els.refName.textContent = Math.round(out.bytes.byteLength / 1024) + " KB";
   } catch (e){
     clearReference();
@@ -651,7 +874,6 @@ function lockSetup(locked){
   els.refClear.disabled = locked;
   els.voiceBtn.disabled = locked;
   els.voiceClear.disabled = locked;
-  els.voiceText.disabled = locked;
 }
 
 /* =========================================================================
@@ -672,7 +894,6 @@ function showTab(which){
   els.promptPane.hidden = !wantPrompt;
   els.transcript.hidden = wantPrompt;
   // hidden, not removed: both keep their boxes so the strip cannot reflow
-  els.turnCount.style.visibility = wantPrompt ? "hidden" : "";
   els.clearBtn.style.visibility = wantPrompt ? "hidden" : "";
   if (wantPrompt) els.promptBox.focus();
 }
@@ -696,10 +917,15 @@ function setDefaultPrompt(text, maxChars){
 }
 els.tabTranscript.addEventListener("click", () => showTab("transcript"));
 els.tabPrompt.addEventListener("click", () => showTab("prompt"));
-els.promptBox.addEventListener("input", () => { S.promptDirty = true; updatePromptNote(); });
+els.promptBox.addEventListener("input", () => {
+  S.promptDirty = true;
+  S.promptSource = "user";        // typed it themselves; it survives avatar swaps
+  updatePromptNote();
+});
 els.promptReset.addEventListener("click", () => {
   els.promptBox.value = S.defaultPrompt;
   S.promptDirty = false;
+  S.promptSource = "default";
   updatePromptNote();
   els.promptBox.focus();
 });
@@ -891,6 +1117,10 @@ function wsURL(){
   const u = new URL("./ws", window.location.href);   // survives proxy path prefixes
   u.protocol = (window.location.protocol === "https:") ? "wss:" : "ws:";
   u.search = ""; u.hash = "";
+  // Which lease this socket belongs to. Several conversations run at once now,
+  // so the server cannot infer it -- the token comes from the `ready` event of
+  // our own /run_session job.
+  if (S.sessionToken) u.searchParams.set("t", S.sessionToken);
   return u.toString();
 }
 function sendBin(tag, payload){
@@ -947,11 +1177,16 @@ async function acquireLease(){
           let ev;
           try { ev = JSON.parse(msg.data[0]); } catch (e){ continue; }
           if (ev.event === "ready"){
+            S.sessionToken = ev.token || "";      // /ws is opened against this
             done(resolve, ev);
           } else if (ev.event === "tick"){
             const r = Math.max(0, Math.round(ev.remaining));
             setLease(r + "s GPU left", r <= 15);
-          } else if (ev.event === "busy" || ev.event === "error"){
+          } else if (ev.event === "busy"){
+            const err = new Error(ev.text || "busy");
+            err.busy = true;                     // caller waits instead of failing
+            done(reject, err);
+          } else if (ev.event === "error"){
             done(reject, new Error(ev.text || ev.event));
           }
         }
@@ -981,6 +1216,9 @@ function connect(){
     sendJSON({ type:"session_config",
                system_prompt: promptOverride(),
                resume: !!S.resume,
+               // Names WHICH conversation to resume; sessions run in
+               // parallel, so "the previous one" is ambiguous server-side.
+               resume_token: S.carryoverToken || "",
                ref_text: (els.voiceText.value || "").trim(),
                reference: !!S.refBytes,
                voice: !!S.voiceBytes });
@@ -1015,7 +1253,7 @@ function connect(){
     if (ev.code === 1013){
       setStatus("busy", "Session in use");
       showOverlay("Someone else is live",
-        "This demo runs one session at a time. Retrying…", true);
+        "All avatar slots are busy right now. Retrying…", true);
     } else {
       setStatus("connecting", "Reconnecting…");
     }
@@ -1035,6 +1273,8 @@ function onJSON(text){
   switch (m.type){
     case "hello":
       els.verLbl.textContent = (m.server || "server") + " · " + (m.fps || FPS) + " fps";
+      // What "Keep going" will present to reclaim THIS conversation.
+      if (m.carryover_token) S.carryoverToken = m.carryover_token;
       setDefaultPrompt(m.system_prompt, m.max_prompt_chars);
       break;
     case "ready":
@@ -1051,6 +1291,11 @@ function onJSON(text){
       systemLine(m.messages
         ? "Continuing — the avatar still remembers " + m.messages + " messages"
         : "Starting fresh — the earlier conversation had expired");
+      break;
+    case "avatar_interrupted":
+      // The rest of this reply was synthesised but never played, so stop the
+      // transcript from implying it was spoken.
+      markInterrupted();
       break;
     case "lease_ended":
       // The server noticed the GPU went away before our own iterator did.
@@ -1074,9 +1319,21 @@ function onJSON(text){
 /* ----------------------------------------------------------- session ctl --- */
 async function startSession(opts){
   if (S.running) return;
+  // The default preset may still be downloading its portrait and voice clip.
+  // Starting without them silently downgrades to the model's default voice.
+  if (S.presetReady){
+    try { await S.presetReady; } catch (e){}
+  }
+  // And an uploaded clip may still be transcribing; starting now would pair
+  // the new audio with a stale transcript. Overlay buttons reach here without
+  // passing the (disabled) start button, so the wait lives here too.
+  if (S.transcribing){
+    try { await S.transcribing; } catch (e){}
+  }
   // resume=true asks the server to seed the new brain with the previous
   // session's turns. Anything else starts clean, transcript included.
   S.resume = !!(opts && opts.resume);
+  if (!S.everStarted){ S.everStarted = true; retireHero(); }
   if (!S.resume) clearTranscript();
   S.closedByUser = false;
   els.startBtn.disabled = true;
@@ -1118,7 +1375,23 @@ async function startSession(opts){
     "longer if others are queued ahead of you.", true);
   setStatus("connecting", "Queued for GPU");
   try {
-    const lease = await acquireLease();
+    // Sessions run in parallel (one GPU worker each), but the pool is finite,
+    // so a refusal means every slot is taken — sit in the queue rather than
+    // sending the visitor away.
+    let lease = null;
+    for (let attempt = 0; lease === null; attempt++){
+      try {
+        lease = await acquireLease();
+      } catch (e){
+        if (!e || !e.busy || attempt >= LEASE_BUSY_RETRIES || S.closedByUser) throw e;
+        setStatus("busy", "Waiting for the GPU");
+        showOverlay("All avatar slots are busy",
+          "Every avatar slot is in use. Waiting for one to free up — " +
+          "this usually takes under a minute.<br>" +
+          `<small>attempt ${attempt + 1} of ${LEASE_BUSY_RETRIES}</small>`, true);
+        await new Promise((r) => setTimeout(r, LEASE_BUSY_DELAY_MS));
+      }
+    }
     LEASE_HINT = Math.round(lease.session_seconds || 0) + "s";
     setLease(Math.round(lease.session_seconds || 0) + "s GPU left", false);
   } catch (e){
@@ -1128,9 +1401,13 @@ async function startSession(opts){
     els.pip.classList.remove("on");
     els.startBtn.disabled = false;
     setStatus("error", "No GPU");
-    showOverlay("Could not get a GPU",
+    const busy = !!(e && e.busy);
+    showOverlay(busy ? "The avatar is still busy" : "Could not get a GPU",
       String((e && e.message) || e) +
-      "<br><small>ZeroGPU quota is per viewer and refills daily.</small>", false);
+      (busy
+        ? "<br><small>One session runs at a time. Try again in a moment.</small>"
+        : "<br><small>If this mentions quota: ZeroGPU quota is per viewer and " +
+          "refills daily.</small>"), false);
     return;
   }
 
@@ -1187,6 +1464,23 @@ function toggleMute(){
   if (S.muted) els.micBar.style.width = "0%";
 }
 
+/* Retire the hero toward the in-column controls, then take it out of the flow.
+   The distance is measured now rather than hard-coded, so it lands on the stop
+   button at any viewport width. */
+function retireHero(){
+  const hero = els.hero;
+  if (!hero || hero.hidden || hero.classList.contains("retiring")) return;
+  const from = els.heroBtn.getBoundingClientRect();
+  const to = els.startBtn.getBoundingClientRect();
+  hero.style.setProperty("--dy", Math.max(0, Math.round(to.top - from.top)) + "px");
+  hero.style.maxHeight = hero.offsetHeight + "px";   // a real value to animate from
+  requestAnimationFrame(() => hero.classList.add("retiring"));
+  const done = () => { hero.hidden = true; };
+  hero.addEventListener("transitionend", done, { once:true });
+  setTimeout(done, 700);            // covers prefers-reduced-motion (no transition)
+}
+
+els.heroBtn.addEventListener("click", () => { if (!S.running) startSession(); });
 els.startBtn.addEventListener("click", () => (S.running ? stopSession() : startSession()));
 els.ovContinue.addEventListener("click", () => startSession({ resume:true }));
 els.ovRestart.addEventListener("click", () => startSession({ resume:false }));

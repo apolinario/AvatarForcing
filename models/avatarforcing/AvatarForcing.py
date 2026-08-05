@@ -461,22 +461,13 @@ class AvatarForcing(BaseDiffusionModel):
         next_timestep = self.denoising_step_list[index + 1] if index < len(self.denoising_step_list) - 1 else current_timestep
 
         if use_kv_cache: # kv inference
-            t_for_denoise_single = torch.cat([
-                torch.zeros((B, 2)),
-                torch.full((B, self.num_frames_per_block), current_timestep)], dim=1).to(dtype=torch.float32, device=self.rank)
-            t_for_next_denoise = torch.cat([
-                torch.zeros((B, 2)),
-                torch.full((B, self.num_frames_per_block), next_timestep)], dim=1).to(dtype=torch.float32, device=self.rank)
+            lead, tail = 2, self.num_frames_per_block
         elif start_pos == 0: # first block (both kv and non-kv)
-            t_for_denoise_single = torch.full((B, self.num_frames_for_clip), current_timestep).to(dtype=torch.float32, device=self.rank)
-            t_for_next_denoise = torch.full((B, self.num_frames_for_clip), next_timestep).to(dtype=torch.float32, device=self.rank)
+            lead, tail = 0, self.num_frames_for_clip
         else: # non-kv infernece
-            t_for_denoise_single = torch.cat([
-                torch.zeros((B, self.num_frames_for_clip - self.num_frames_per_block)),
-                torch.full((B, self.num_frames_per_block), current_timestep)], dim=1).to(dtype=torch.float32, device=self.rank)
-            t_for_next_denoise = torch.cat([
-                torch.zeros((B, self.num_frames_for_clip - self.num_frames_per_block)),
-                torch.full((B, self.num_frames_per_block), next_timestep)], dim=1).to(dtype=torch.float32, device=self.rank)
+            lead, tail = self.num_frames_for_clip - self.num_frames_per_block, self.num_frames_per_block
+        t_for_denoise_single = self._timestep_row(B, lead, tail, current_timestep)
+        t_for_next_denoise = self._timestep_row(B, lead, tail, next_timestep)
         return self.solve_closed(flow_pred=v_t, xt=x_t, timestep=t_for_denoise_single, next_timestep=t_for_next_denoise)
         
 
@@ -499,13 +490,39 @@ class AvatarForcing(BaseDiffusionModel):
         return precomputed_c, precomputed_wr, precomputed_adaLN
 
 
+    def _timestep_row(self, B: int, lead: int, tail: int, value) -> torch.Tensor:
+        """``[B, lead+tail]``: ``lead`` zeros (clean history) then ``value``.
+
+        Built straight on the GPU. This is rebuilt for every denoise step -- 9x
+        per 400 ms block, twice each -- and assembling it on the host cost an
+        H2D copy every time.
+        """
+        row = torch.zeros((B, lead + tail), dtype=torch.float32, device=self.rank)
+        if tail:
+            # `denoising_step_list` is a CPU tensor, so float() is free here.
+            row[:, lead:] = float(value)
+        return row
+
+    def _scheduler_tables(self, device):
+        """The scheduler's timestep/sigma tables, cached on the GPU.
+
+        Both are constant through inference but were copied from the host on
+        every denoise step.
+        """
+        cache = getattr(self, "_sched_tbl_cache", None)
+        if cache is None or cache[0] != device:
+            cache = (device,
+                     self.scheduler.timesteps.to(device=device, dtype=torch.double),
+                     self.scheduler.sigmas.to(device=device, dtype=torch.double))
+            self._sched_tbl_cache = cache
+        return cache[1], cache[2]
+
     def solve_closed(self, flow_pred: torch.Tensor, xt: torch.Tensor, timestep: torch.Tensor, next_timestep: torch.Tensor) -> torch.Tensor:
         orig_dtype, device = xt.dtype, xt.device
 
         v  = flow_pred.to(device=device, dtype=torch.double)  # [B,T,D]
         x  = xt.to(device=device, dtype=torch.double)         # [B,T,D]
-        timesteps_tbl = self.scheduler.timesteps.to(device=device, dtype=torch.double)  # (K,)
-        sigmas_tbl    = self.scheduler.sigmas.to(device=device, dtype=torch.double)     # (K,)
+        timesteps_tbl, sigmas_tbl = self._scheduler_tables(device)  # (K,), (K,)
 
         t_cur  = timestep.to(device=device, dtype=torch.double)         # [B,T]
         t_next = next_timestep.to(device=device, dtype=torch.double)    # [B,T]
@@ -526,9 +543,13 @@ class AvatarForcing(BaseDiffusionModel):
         alpha_t, alpha_tp = 1.0 - sigma_t, 1.0 - sigma_tp
 
         x0_hat = x - sigma_t.unsqueeze(-1) * v   # [B,T,D]
-        ratio = torch.zeros_like(sigma_tp)
+        # `where`, not `ratio[valid] = ...`: boolean-mask indexing has a
+        # data-dependent output shape, so it synchronises the CUDA stream --
+        # three times per denoise step, 27 times per 400 ms block. The clamp
+        # keeps the discarded branch finite, so the two forms agree exactly.
         valid = (sigma_t > 0)
-        ratio[valid] = sigma_tp[valid] / torch.clamp(sigma_t[valid], min=1e-8)
+        ratio = torch.where(valid, sigma_tp / torch.clamp(sigma_t, min=1e-8),
+                            torch.zeros_like(sigma_tp))
         xt_next = (ratio.unsqueeze(-1) * x + (alpha_tp - ratio * alpha_t).unsqueeze(-1) * x0_hat)
         hist_mask = (zero_t & zero_tp).unsqueeze(-1)  # [B,T,1]
         xt_next = torch.where(hist_mask, x, xt_next)

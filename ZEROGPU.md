@@ -22,10 +22,12 @@ So the GPU is leased **once per conversation** instead of once per block.
 ## The delta
 
 **`server/gpu_session.py`** (new) — a `@spaces.GPU` generator that forks a
-worker, warms the engine, announces `__READY__` and then serves an RPC loop over
-fork-context queues until the lease expires. Queues are created at *import* time,
-in the parent, so the worker inherits them with their pipes intact and the parent
-can keep feeding a worker that is already blocked on `get()`.
+worker, warms the engine, announces `ready` and then serves an RPC loop over
+fork-context queues until the lease expires. Queue pairs — one per concurrent
+session (`AVATAR_MAX_SESSIONS`, default 4) — are created at *import* time, in
+the parent, so every worker inherits them with their pipes intact; sessions
+claim a slot and up to four conversations run in parallel, each on its own GPU
+allocation.
 
 The worker owns the engine, the face cropper, the cropped-frame ring **and** JPEG
 encoding. That last part is not incidental: the naive split (parent crops, ships

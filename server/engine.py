@@ -1,4 +1,4 @@
-"""Real-time streaming engine for AvatarForcing (Agent C).
+"""Real-time streaming engine for AvatarForcing.
 
 This module re-formulates ``AvatarForcing.sample()`` (which is written as an
 offline, whole-utterance block loop) into an **incremental** engine that
@@ -12,7 +12,7 @@ Public contract (see ``DESIGN.md``)::
         BLOCK_FRAMES = 10; BLOCK_SAMPLES = 6400
         PRIME_FRAMES = 50; SIZE = 512
 
-        def __init__(self, ref_image_path, repo_dir=<repo root>, device="cuda")
+        def __init__(self, ref_image_path, repo_dir="AvatarForcing", device="cuda")
         def load(self) -> None
         def set_reference(image=None) -> float          # None -> ref_image_path
         def start_session(first_user_frame: uint8[H,W,3] | None) -> uint8[50,512,512,3]
@@ -43,8 +43,6 @@ instead of pre-computed full-utterance tensors. Every tensor-level call
 (``prepare_cfg_condition`` / ``solve_cfg`` / ``update_kv_cache`` /
 ``decode_block``) is the upstream implementation, unmodified.
 
-See ``reports/engine.md`` for the audio-window design, the rotary-embedding fix
-that lifts the ~41 s session limit, validation results and benchmarks.
 """
 
 from __future__ import annotations
@@ -106,7 +104,7 @@ def get_shared_face_detector(device: str = "cuda"):
       AvatarForcing never uses, and
     * its ``__init__`` flips ``torch.backends.cudnn.benchmark = True``, which
       turns the first pass through the motion encoder into a 14-27 s cudnn
-      autotune (measured by Agent A).
+      autotune.
 
     ``face_alignment.detection.sfd.detect.batch_detect`` *also* sets
     ``cudnn.benchmark = True`` on every call, so every detection in this module
@@ -243,6 +241,15 @@ class FaceCropper:
     ) -> None:
         self.SIZE = int(size)
         self.device = device
+        # Upstream crops a whole video with ONE box: it detects per frame, then
+        # averages over the entire clip (preprocess_user_video.py) so the box
+        # never moves and the user's head motion stays in the frame content --
+        # which is what the model reacts to. A live stream cannot average over
+        # the future, so instead average the first N detections and then freeze.
+        # 0 keeps the original tracking behaviour (box re-centres slowly).
+        self.lock_after = int(_envf("AVATAR_CROP_LOCK_FRAMES", 50))
+        self._lock_samples: list = []
+        self.locked = False
         self.detect_every = int(detect_every)
         self.retry_every = int(retry_every)
         self.pad_ratio = float(pad_ratio)
@@ -300,6 +307,24 @@ class FaceCropper:
         half = max(bsy, bsx) * (1.0 + self.pad_ratio)
         return mx, my, half
 
+    def _lock_box(self, mx: float, my: float, half: float) -> bool:
+        """Collect detections, then freeze the mean — upstream's fixed box.
+
+        Returns True once locked, after which detections are ignored.
+        """
+        if self.lock_after <= 0 or self.locked:
+            return self.locked
+        self._lock_samples.append((mx, my, half))
+        if len(self._lock_samples) < self.lock_after:
+            return False
+        n = len(self._lock_samples)
+        self._mx = sum(v[0] for v in self._lock_samples) / n
+        self._my = sum(v[1] for v in self._lock_samples) / n
+        self._half = sum(v[2] for v in self._lock_samples) / n
+        self.locked = True
+        self._lock_samples = []
+        return True
+
     def _update_box(self, box) -> None:
         mx, my, half = box
         if self._mx is None:
@@ -323,13 +348,23 @@ class FaceCropper:
 
         n = self.n_crops
         self.n_crops += 1
-        need = (self._half is None and n % max(1, self.retry_every) == 0) or (
-            self._half is not None and n % max(1, self.detect_every) == 0
-        )
-        if need:
+        if self.lock_after > 0 and not self.locked:
+            # Locking phase: detect every frame to build the average fast, the
+            # way upstream averages every frame of the clip.
             box = self.detect_box(arr)
             if box is not None:
-                self._update_box(box)
+                self._update_box(box)          # something usable meanwhile
+                self._lock_box(*box)
+        elif not self.locked:
+            need = (self._half is None and n % max(1, self.retry_every) == 0) or (
+                self._half is not None and n % max(1, self.detect_every) == 0
+            )
+            if need:
+                box = self.detect_box(arr)
+                if box is not None:
+                    self._update_box(box)
+        # locked: the box never moves again, so the user's head motion stays in
+        # the frame content instead of being tracked out of it.
 
         if self._half is None:  # never saw a face -> centre square
             s = min(h, w)
@@ -350,6 +385,8 @@ class FaceCropper:
     # convenience for warmup / bench
     def reset(self) -> None:
         self._mx = self._my = self._half = None
+        self._lock_samples = []
+        self.locked = False
         self.n_crops = 0
 
 
@@ -372,7 +409,7 @@ class AvatarEngine:
     def __init__(
         self,
         ref_image_path: str,
-        repo_dir: str = _APP_DIR,   # this repo root; server/ lives inside it
+        repo_dir: str = "AvatarForcing",
         device: str = "cuda",
         *,
         nfe: int = 10,
@@ -559,7 +596,7 @@ class AvatarEngine:
 
     # ------------------------------------------------------------------ #
     def _install_big_rope_table(self) -> None:
-        """Enlarge the rotary ``freqs_cis`` table (trap (a) from Agent A).
+        """Enlarge the rotary ``freqs_cis`` table.
 
         ``Attention`` registers ``freqs_cis = precompute_freqs_cis(head_dim,
         max_seq_len=1024)``. In KV-cache mode ``start_pos = t - 2`` grows without
@@ -741,8 +778,7 @@ class AvatarEngine:
 
         ``wave`` must already be normalised. ``AudioEncoder.inference`` only
         replicate-pads when ``len(wave) % (seq_len*640) != 0``; we always feed
-        exactly ``seq_len*640`` samples so the padding path stays dormant (trap
-        6 in Agent A's report).
+        exactly ``seq_len*640`` samples so the padding path stays dormant.
         """
         import torch
 
@@ -844,7 +880,7 @@ class AvatarEngine:
     def _anchor_pose(self, x_t):
         """Dead-zone proportional pull of the *slow* motion component toward ``r_s``.
 
-        Root cause of the long-session degradation (reports/drift.md): splitting
+        Root cause of the long-session degradation: splitting
         the generated latents into a slow part (10 s temporal mean = head pose)
         and a fast part (expression / lip-sync), the fast part is stable at
         ``|z| ~ 2-8`` for 320 s while the slow part random-walks away from the

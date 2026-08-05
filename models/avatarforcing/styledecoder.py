@@ -379,8 +379,20 @@ class ToRGB(nn.Module):
         return out
 
 
+def base_sampling_grid(size):
+    """The identity sampling grid ``ToFlow`` adds its predicted offsets to.
+
+    Byte-identical to what upstream builds inline — same ``np.linspace`` /
+    ``np.meshgrid`` / ``np.stack`` — just built once instead of on every call.
+    """
+    xs = np.linspace(-1, 1, size)
+    xs = np.meshgrid(xs, xs)
+    xs = np.stack(xs, 2)
+    return torch.tensor(xs, requires_grad=False).float().unsqueeze(0)
+
+
 class ToFlow(nn.Module):
-    def __init__(self, in_channel, style_dim, upsample=True, blur_kernel=[1, 3, 3, 1]):
+    def __init__(self, in_channel, style_dim, upsample=True, blur_kernel=[1, 3, 3, 1], size=None):
         super().__init__()
 
         if upsample:
@@ -389,16 +401,31 @@ class ToFlow(nn.Module):
         self.conv = ModulatedConv2d(in_channel, 3, 1, style_dim, demodulate=False)
         self.bias = nn.Parameter(torch.zeros(1, 3, 1, 1))
 
+        # NOTE(aoti): upstream rebuilt this grid with numpy inside forward() and
+        # shipped it to the GPU on every call -- at 512x512 that is a 20 MB
+        # host-to-device copy per decode, seven of them per block. Worse for
+        # torch.export: `torch.tensor(...)` on a numpy array is lifted as an
+        # *anonymous* constant that appears in no state_dict, so the AoTI
+        # artifact loaded with 184 constants unset and faulted on its first call
+        # ("illegal memory access"). Registering it (non-persistent, so
+        # checkpoints are unaffected) makes it a named buffer that both the
+        # exporter and the loader can see. Values are unchanged.
+        if size is not None:
+            self.register_buffer("base_grid", base_sampling_grid(size), persistent=False)
+        else:
+            self.base_grid = None
+
     def forward(self, input, style, feat, skip=None):
         out = self.conv(input, style)
         out = out + self.bias
 
         # warping
-        xs = np.linspace(-1, 1, input.size(2))
-        xs = np.meshgrid(xs, xs)
-        xs = np.stack(xs, 2)
-
-        xs = torch.tensor(xs, requires_grad=False).float().unsqueeze(0).repeat(input.size(0), 1, 1, 1).to(input.device)
+        xs = self.base_grid
+        if xs is None or xs.shape[1] != input.size(2):
+            # Any resolution this instance was not built for: exactly the old
+            # path, so no caller can be surprised.
+            xs = base_sampling_grid(input.size(2)).to(input.device)
+        xs = xs.expand(input.size(0), -1, -1, -1)
 
         if skip is not None:
             skip = self.upsample(skip)
@@ -475,7 +502,9 @@ class Synthesis(nn.Module):
             self.convs.append(StyledConv(out_channel, out_channel, 3, style_dim, blur_kernel=blur_kernel))
             self.to_rgbs.append(ToRGB(out_channel, style_dim))
 
-            self.to_flows.append(ToFlow(out_channel, style_dim))
+            # 2 ** i is the resolution this level produces (conv1 upsamples into
+            # it), which is what ToFlow needs to precompute its sampling grid.
+            self.to_flows.append(ToFlow(out_channel, style_dim, size=2 ** i))
 
             in_channel = out_channel
 

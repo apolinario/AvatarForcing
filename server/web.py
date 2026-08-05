@@ -5,15 +5,15 @@
 
     GET  /            -> static/index.html
     GET  /defaults    -> JSON {system_prompt, max_prompt_chars} for the UI editor
+    GET  /presets     -> JSON built-in avatars (portrait + voice + personality)
+    GET  /preset/{n}  -> one preset asset (jpg / wav)
     GET  /healthz     -> JSON status (lease held? session busy?)
     POST /voice       -> transcribe an uploaded voice clip (CPU, this process)
     API  /run_session -> holds the ZeroGPU lease, streams ready/tick/expired
     WS   /ws          -> the binary real-time protocol from DESIGN.md
 
-This module is deliberately framework-clean: it never imports the mocks nor the
-real engine/brain. Whatever the factories return is used, so swapping
-``server.engine.AvatarEngine`` / ``server.conversation.ConversationBrain`` in
-requires no change here.
+This module never imports the engine or the brain directly: whatever the
+factories return is used, so either can be swapped without changes here.
 
 WebSocket protocol (little-endian, first byte = tag)
 ---------------------------------------------------
@@ -65,22 +65,33 @@ The voice clip, its transcript and ``system_prompt`` are held in memory for the
 session only — never logged, never echoed back, never written to ``/healthz``
 (which reports bools, not the values).
 
-Concurrency model (one WS session at a time)
--------------------------------------------
-  * ``_GPU_EXECUTOR``  – ONE thread, module-global. Every call that reaches the
-    GPU is submitted there, so the GPU is never re-entered concurrently even
-    across reconnects.
-  * ``_CROP_EXECUTOR`` – ONE thread, submitting webcam frames for cropping (the
-    real cropper keeps EMA state, so it must stay single-threaded).
+Concurrency model (several conversations at once)
+------------------------------------------------
+Up to ``gpu_session.MAX_SESSIONS`` conversations run in parallel, each with its
+own GPU worker. Per conversation:
+
+  * ``_Session._gpu_exec``  – ONE thread. Every call that reaches that session's
+    GPU is submitted there, so its worker is never re-entered concurrently.
+  * ``_Session._crop_exec`` – ONE thread, submitting webcam frames for cropping
+    (the cropper keeps EMA state, so it must stay single-threaded).
   * a single writer task owns the WebSocket; every other task enqueues frames,
     so we never interleave two concurrent ``send_bytes`` calls.
 
+The single thread is load-bearing *within* a conversation, for ordering;
+sharing one between conversations would serialise them.
+
+A conversation spans two connections — the ``/run_session`` job holding the
+lease and the ``/ws`` streaming it — so ``/run_session`` mints a token, hands it
+to the client in ``ready``, and the client presents it as ``?t=`` on ``/ws``.
+
 ZeroGPU
 -------
-There is no GPU in this process. Both executors above now hand their work to
-``server.gpu_session.PROXY``, which forwards it over fork-context queues to a
-worker holding a ``@spaces.GPU`` lease — see ``server/gpu_session.py`` for why
-the state cannot live here. Three consequences show up in this file:
+There is no GPU in this process. Both executors above hand their work to that
+session's ``gpu_session.GPUProxy``, which forwards it over the fork-context
+queue pair for its slot to a worker holding a ``@spaces.GPU`` lease — see
+``server/gpu_session.py`` for why the state cannot live here, and why the queue
+pairs are a pool built at import rather than made per session. Three
+consequences show up in this file:
 
   * the frame ring, the face cropper and JPEG **encoding** moved into the
     worker, so ``step`` returns ready-made JPEGs and ``_crop_task`` only ships
@@ -99,14 +110,16 @@ import contextlib
 import json
 import logging
 import os
+import secrets
 import struct
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable
 
 import numpy as np
 from fastapi import Request, WebSocket, WebSocketDisconnect
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 
 from server import gpu_session
 from server.gpu_session import LeaseError
@@ -151,9 +164,6 @@ RESYNC_SEC = float(os.environ.get("AVATAR_RESYNC_SEC", "1.2"))
 # 40 s and the 400 ms morph reads as a cut. It also cannot fire at all while the
 # avatar speaks continuously, which is exactly when drift is unchecked. 0 disables.
 REPRIME_SECS = float(os.environ.get("AVATAR_REPRIME_SECS", "0"))
-# AVATAR_JPEG_QUALITY / AVATAR_JPEG_SUBSAMPLING / AVATAR_REPRIME_XFADE /
-# AVATAR_CAM_WARM_SIZE are read in server/gpu_session.py now -- encoding, the
-# re-prime dissolve and the cropper warm-up all happen in the GPU worker.
 SEND_QUEUE_MAX = 240            # ~9 blocks of video+audio; video dropped if full
 # How long the session waits for the client's {"type":"session_config"} before
 # falling back to the server defaults. Our own client sends it in the same tick
@@ -175,22 +185,51 @@ MAX_PROMPT_CHARS = int(os.environ.get("AVATAR_MAX_PROMPT_CHARS", "8192"))
 
 STATIC_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "static")
 
-# Module-global executors: shared across connections so a reconnect can never
-# create a second GPU thread. Both now submit RPCs to the leased worker rather
-# than touching CUDA; the JPEG pool moved into the worker with the encoding.
-_GPU_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="gpu")
-_CROP_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="crop")
+# Live conversations, keyed by the token /run_session mints and the client
+# presents on /ws. Two registries because the lease job and the websocket are
+# separate connections with separate lifetimes: the holder appears first and
+# outlives the socket.
+_HOLDERS_LOCK = threading.Lock()
+_HOLDERS: dict[str, Any] = {}          # token -> _LeaseHolder
+_WS_SESSIONS: dict[str, Any] = {}      # token -> _Session
 
 # Conversation carried across a lease boundary, for the client's "Keep going".
 # A ZeroGPU lease is reclaimed every SESSION_SECONDS, so without this every
 # session starts amnesiac. Only the LLM turn list travels; the brain, its
-# ElevenLabs socket and the video rollout are all rebuilt. Kept module-level
+# OmniVoice voice prompt and the video rollout are all rebuilt. Kept module-level
 # (not per-connection) precisely because the WebSocket dies with the lease.
 #
-# One slot is enough: the Space serves one session at a time. It holds user
-# speech and avatar replies, so it expires rather than lingering indefinitely.
+# It holds user speech and avatar replies, so entries expire rather than
+# lingering indefinitely.
 CARRYOVER_TTL = float(os.environ.get("AVATAR_CARRYOVER_TTL", "900"))  # 15 min
-_CARRYOVER: dict[str, Any] = {"history": [], "at": 0.0}
+# Keyed by an unguessable resume token, NOT global. It was a single slot while
+# the Space served one conversation at a time; with several live, a shared slot
+# would hand one visitor's transcript to the next person who pressed "Keep
+# going". The token is minted when a session ends and handed only to that
+# session's client.
+_CARRYOVER: dict[str, dict[str, Any]] = {}
+_CARRYOVER_LOCK = threading.Lock()
+
+
+def _carryover_put(tok: str, history: list) -> None:
+    """Stash a finished conversation under the token its client already holds."""
+    now = time.monotonic()
+    with _CARRYOVER_LOCK:
+        for k, v in [(k, v) for k, v in _CARRYOVER.items()
+                     if now - v["at"] > CARRYOVER_TTL]:
+            _CARRYOVER.pop(k, None)          # expire on write; no sweeper thread
+        _CARRYOVER[tok] = {"history": history, "at": now}
+
+
+def _carryover_take(tok: str | None) -> list:
+    """Reclaim a conversation. Single-use: resuming twice is not a thing."""
+    if not tok:
+        return []
+    with _CARRYOVER_LOCK:
+        entry = _CARRYOVER.pop(tok, None)
+    if entry is None or time.monotonic() - entry["at"] > CARRYOVER_TTL:
+        return []
+    return entry["history"]
 
 
 # =========================================================================== #
@@ -237,12 +276,6 @@ class MicRing:
         return out
 
 
-# NOTE: _jpeg_bytes_to_rgb / _rgb_to_jpeg / _xfade used to live here. They moved
-# into server/gpu_session.py's worker: decoding and cropping happen next to the
-# GPU that needs the result, and encoding happens next to the frames that would
-# otherwise have to be pickled across the fork as 16 MB of raw uint8 per block.
-
-
 def _pack_audio(block_idx: int, pcm_i16: np.ndarray) -> bytes:
     a = np.asarray(pcm_i16)
     if a.dtype != np.int16:
@@ -260,23 +293,22 @@ def _pack_video(block_idx: int, frame_in_block: int, jpeg: bytes) -> bytes:
 # lease holder
 # =========================================================================== #
 class _LeaseHolder:
-    """Tracks whether a ZeroGPU lease is currently held.
+    """Tracks whether this conversation's GPU lease is currently held.
 
-    On the dedicated Space this class built and ``load()``ed the engine once, in
-    the GPU thread. On ZeroGPU the engine is built at import (``app.py``, where
-    ZeroGPU packs its weights) and warmed inside the lease, so nothing here
-    touches the model: it only reports whether ``/run_session`` has a worker up,
-    and hands out the proxy that talks to it.
+    Never touches the model: it only reports whether ``/run_session`` has a
+    worker up, and hands out the proxy that talks to it.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, proxy: Any) -> None:
+        # One holder per conversation, bound to that conversation's proxy.
+        self.proxy = proxy
         self.load_error: str | None = None
         self.warm_seconds: float | None = None
         self.session_seconds: float | None = None
 
     @property
     def loaded(self) -> bool:
-        return gpu_session.PROXY.live
+        return self.proxy.live
 
     def on_ready(self, warm_seconds: float, session_seconds: float) -> None:
         self.warm_seconds = warm_seconds
@@ -285,11 +317,10 @@ class _LeaseHolder:
 
     async def get(self) -> Any:
         """Return the live proxy, or explain why there isn't one."""
-        proxy = gpu_session.PROXY
-        if not proxy.live:
-            raise LeaseError(proxy.last_error
+        if not self.proxy.live:
+            raise LeaseError(self.proxy.last_error
                              or "no GPU lease — call /run_session first")
-        return proxy
+        return self.proxy
 
 
 # =========================================================================== #
@@ -299,10 +330,16 @@ class _Session:
     def __init__(self, ws: WebSocket, gpu: Any,
                  brain_factory: Callable[..., Any]) -> None:
         self.ws = ws
-        # The leased worker. Owns the engine, the cropper and the frame ring;
-        # every attribute this class used to read off `engine` now arrives as an
-        # RPC result instead.
+        # The leased worker: owns the engine, the cropper and the frame ring.
         self.gpu = gpu
+        # One thread each, per session. The single thread orders calls within
+        # this conversation (set_reference must land before prime); per session
+        # so conversations never serialise on each other.
+        slot = getattr(gpu, "slot", 0)
+        self._gpu_exec = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix=f"gpu{slot}")
+        self._crop_exec = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix=f"crop{slot}")
         # Built by configurator(), not here: the client's system_prompt has to
         # reach brain_factory, and it only arrives with `session_config`.
         self.brain_factory = brain_factory
@@ -321,6 +358,10 @@ class _Session:
         # per-session config handshake (see the protocol docstring)
         self.session_cfg: dict[str, Any] = {}  # holds ref_text; never logged
         self.resume = False                    # continue the previous conversation
+        self.resume_token = ""                 # which conversation, specifically
+        # Handed to the client in `hello`; whatever this session says is stored
+        # under it at teardown, so only this client can resume this talk.
+        self.carryover_token = secrets.token_urlsafe(16)
         self.resumed_messages = 0
         self.ref_bytes: bytes | None = None
         self.voice_bytes: bytes | None = None
@@ -469,6 +510,7 @@ class _Session:
             log.info("client hello: %s", msg)
         elif t == "session_config":
             self.resume = bool(msg.get("resume"))
+            self.resume_token = str(msg.get("resume_token") or "")
             ref_text = str(msg.get("ref_text") or "").strip()[:MAX_PROMPT_CHARS]
             if ref_text:
                 self.session_cfg["ref_text"] = ref_text     # NOT logged
@@ -505,7 +547,7 @@ class _Session:
         """
         try:
             res = await self.loop.run_in_executor(
-                _CROP_EXECUTOR, self.gpu.push_frame, jpeg)
+                self._crop_exec, self.gpu.push_frame, jpeg)
             self.n_cropped = res.get("n_cropped", self.n_cropped + 1)
             self.have_first_frame = True
         except LeaseError as exc:
@@ -608,14 +650,14 @@ class _Session:
                     # cadence and the block indices are unaffected. The worker
                     # owns the cross-dissolve that hides the pose cut.
                     res = await self.loop.run_in_executor(
-                        _GPU_EXECUTOR, self.gpu.reprime)
+                        self._gpu_exec, self.gpu.reprime)
                     self._last_prime_at = time.monotonic()
                     self.n_reprimes += 1
                     log.info("re-primed engine at block %d (drift reset #%d)",
                              b, self.n_reprimes)
                 else:
                     res = await self.loop.run_in_executor(
-                        _GPU_EXECUTOR, self.gpu.step, avatar_f32, user_f32)
+                        self._gpu_exec, self.gpu.step, avatar_f32, user_f32)
             except LeaseError as exc:
                 self._on_lease_lost(exc)
                 return
@@ -663,7 +705,7 @@ class _Session:
         """Apply the client's per-session config, then release brain + primer.
 
         The reference swap is engine-level state, so the ordering here is
-        load-bearing: ``set_reference`` is queued on ``_GPU_EXECUTOR`` and
+        load-bearing: ``set_reference`` is queued on ``self._gpu_exec`` and
         awaited *before* ``configured`` is set, hence strictly before this
         session's ``start_session()`` and its first ``step()``. Off the 400 ms
         path entirely — it happens once, while the client is still opening its
@@ -677,7 +719,7 @@ class _Session:
         try:
             if self.ref_bytes is not None:
                 secs = await self.loop.run_in_executor(
-                    _GPU_EXECUTOR, self.gpu.set_reference, self.ref_bytes)
+                    self._gpu_exec, self.gpu.set_reference, self.ref_bytes)
                 self.ref_applied = True
                 log.info("custom reference applied (%.0f KB) in %.0f ms",
                          len(self.ref_bytes) / 1024.0, secs * 1000.0)
@@ -687,14 +729,14 @@ class _Session:
                 # (A fresh lease always starts on the default, so this only
                 # fires when two sessions share one lease.)
                 secs = await self.loop.run_in_executor(
-                    _GPU_EXECUTOR, self.gpu.set_reference, None)
+                    self._gpu_exec, self.gpu.set_reference, None)
                 log.info("restored default reference in %.0f ms", secs * 1000.0)
             # The voice prompt is engine-level state too, and building it costs
             # ~750 ms, so it is paid here (while the client is still opening its
             # camera) rather than on the first phrase of the first reply.
             if self.voice_bytes is not None:
                 res = await self.loop.run_in_executor(
-                    _GPU_EXECUTOR, self.gpu.tts_set_voice, self.voice_bytes,
+                    self._gpu_exec, self.gpu.tts_set_voice, self.voice_bytes,
                     self.session_cfg.get("ref_text"), "session")
                 self.voice_applied = bool(res.get("cloned"))
                 log.info("voice clone applied (%.0f KB) in %.0f ms",
@@ -714,8 +756,8 @@ class _Session:
     async def brain_starter(self) -> None:
         """Build + bring up the ConversationBrain, concurrently with priming.
 
-        ``brain.start()`` costs a lazy import of the ElevenLabs/OpenAI SDKs plus
-        a thread hand-off. Awaiting it before the reader/primer tasks exist would
+        ``brain.start()`` costs a lazy SDK import plus a thread hand-off.
+        Awaiting it before the reader/primer tasks exist would
         stall webcam ingestion (and therefore ``ready``) for its whole duration,
         so it gets its own task. Everything the brain exposes is safe to call
         before ``start()``: ``feed_user_audio`` only buffers, ``set_user_snapshot``
@@ -724,14 +766,14 @@ class _Session:
         await self.configured.wait()        # session_cfg carries the voice id
         t0 = time.perf_counter()
         try:
-            self.brain = self.brain_factory(self.on_brain_event, self.session_cfg)
+            self.brain = self.brain_factory(self.on_brain_event, self.session_cfg,
+                                            proxy=self.gpu)
             # Seed BEFORE start(): the first user turn must already see the
             # earlier conversation, or the avatar reintroduces itself.
             if self.resume and hasattr(self.brain, "import_history"):
-                fresh = time.monotonic() - _CARRYOVER["at"] < CARRYOVER_TTL
-                if fresh and _CARRYOVER["history"]:
-                    self.resumed_messages = self.brain.import_history(
-                        _CARRYOVER["history"])
+                history = _carryover_take(self.resume_token)
+                if history:
+                    self.resumed_messages = self.brain.import_history(history)
                     log.info("resumed conversation: %d messages carried over",
                              self.resumed_messages)
                     self.enqueue({"type": "resumed",
@@ -740,17 +782,20 @@ class _Session:
                     log.info("resume requested but no carryover within %.0fs",
                              CARRYOVER_TTL)
                     self.enqueue({"type": "resumed", "messages": 0})
-            elif not self.resume:
-                # Explicitly starting over: drop the retained turns now rather
-                # than letting them sit until the TTL. The client clears its
-                # transcript in the same gesture, so leaving the server half of
-                # the conversation alive would be both surprising and needless
-                # retention of what the previous user said.
-                if _CARRYOVER["history"]:
+            elif not self.resume and self.resume_token:
+                # Explicitly starting over: drop THIS client's retained turns now
+                # rather than letting them sit until the TTL. The client clears
+                # its transcript in the same gesture, so leaving the server half
+                # of the conversation alive would be both surprising and needless
+                # retention of what was said.
+                #
+                # Only ever this client's own entry: _carryover_take() is keyed
+                # by the token they were given, so starting a fresh session
+                # cannot discard anyone else's conversation.
+                dropped = _carryover_take(self.resume_token)
+                if dropped:
                     log.info("new session: discarding %d carried-over messages",
-                             len(_CARRYOVER["history"]))
-                _CARRYOVER["history"] = []
-                _CARRYOVER["at"] = 0.0
+                             len(dropped))
             await self.brain.start()
         except Exception as exc:
             log.exception("brain.start failed")
@@ -782,7 +827,7 @@ class _Session:
         log.info("priming engine with the worker's first cropped frame")
         tic = time.perf_counter()
         try:
-            await self.loop.run_in_executor(_GPU_EXECUTOR, self.gpu.prime)
+            await self.loop.run_in_executor(self._gpu_exec, self.gpu.prime)
         except LeaseError as exc:
             self._on_lease_lost(exc)
             return
@@ -869,8 +914,9 @@ def build_app(
     static = static_dir or STATIC_DIR
     app = Server(title="Real-Time Conversational Avatar", docs_url=None, redoc_url=None)
 
-    holder = _LeaseHolder()
-    state: dict[str, Any] = {"session": None, "sessions_total": 0, "lease": False}
+    # Only a counter now: "is a session running" and "is a lease held" are
+    # properties of the registries above, since there can be several of each.
+    state: dict[str, Any] = {"sessions_total": 0}
 
     # ---------------------------------------------------------------- lease -- #
     # Registered as a Gradio API endpoint rather than a raw route on purpose:
@@ -879,40 +925,54 @@ def build_app(
     # X-IP-Token, so the GPU seconds are billed to whoever is watching instead
     # of falling back to the Space's shared IP quota.
     @spaces.GPU(duration=gpu_session.LEASE_SECONDS, size=gpu_session.GPU_SIZE)
-    def _hold_lease(lease_id: int):
-        # lease_id is passed IN (pickled to the worker) rather than read from
-        # the module global there: ZeroGPU reuses worker processes, and a reused
-        # one holds a stale global.
+    def _hold_lease(lease_id: int, slot: int):
+        # Both are passed IN (pickled to the worker) rather than read from module
+        # globals there: ZeroGPU reuses worker processes, and a reused one holds
+        # stale globals. `slot` selects which of the import-time queue pairs this
+        # conversation talks over, which is what lets several run at once.
         yield from gpu_session.gpu_worker_body(
             engine_factory, face_cropper_factory, gpu_session.LEASE_SECONDS,
-            speech_factory=speech_factory, lease_id=lease_id)
+            speech_factory=speech_factory, lease_id=lease_id, slot=slot)
 
     @app.api(name="run_session")
     def run_session() -> str:
         """Hold one GPU lease for the duration of a conversation.
 
-        Yields JSON status lines: ``ready`` (the client may now open ``/ws``),
-        then a per-second ``tick`` countdown, then ``expired``.
+        Yields JSON status lines: ``ready`` (carrying the token the client must
+        present on ``/ws``), then a per-second ``tick`` countdown, then
+        ``expired``. Several of these run concurrently -- one slot each.
         """
-        if state["lease"]:
-            yield json.dumps({"event": "busy",
-                              "text": "Another session is running. Try again shortly."})
+        claimed = gpu_session.new_session()
+        if claimed is None:
+            yield json.dumps({
+                "event": "busy",
+                "text": (f"All {gpu_session.MAX_SESSIONS} avatar slots are in "
+                         "use. Try again shortly.")})
             return
-        state["lease"] = True
-        gpu_session.PROXY.open()
+        token, proxy = claimed
+        holder = _LeaseHolder(proxy)
+        with _HOLDERS_LOCK:
+            _HOLDERS[token] = holder
+        proxy.open()
+        log.info("lease starting on slot %d (%d/%d in use)", proxy.slot,
+                 gpu_session.slots_in_use(), gpu_session.MAX_SESSIONS)
         try:
-            for msg in _hold_lease(gpu_session.PROXY.lease_id):
+            for msg in _hold_lease(proxy.lease_id, proxy.slot):
                 if msg.get("event") == "ready":
                     holder.on_ready(msg.get("warm_seconds", 0.0),
                                     msg.get("session_seconds", 0.0))
+                    # The client needs this to open the matching /ws.
+                    msg = {**msg, "token": token}
                 yield json.dumps(msg)
         except Exception as exc:
             log.exception("lease failed")
             holder.load_error = f"{type(exc).__name__}: {exc}"
             yield json.dumps({"event": "error", "text": holder.load_error})
         finally:
-            gpu_session.PROXY.close("the GPU lease ended")
-            state["lease"] = False
+            proxy.close("the GPU lease ended")
+            with _HOLDERS_LOCK:
+                _HOLDERS.pop(token, None)
+            gpu_session.end_session(token)
 
     # ---- routes (registered BEFORE launch() so they win over gradio's) ---- #
     @app.get("/", response_class=HTMLResponse)
@@ -935,6 +995,35 @@ def build_app(
             "system_prompt": default_system_prompt,
             "max_prompt_chars": MAX_PROMPT_CHARS,
         })
+
+    @app.get("/presets")
+    async def presets_list() -> JSONResponse:
+        """The built-in avatars: portrait, voice clip, transcript, personality."""
+        from server import presets as _presets
+
+        return JSONResponse({"presets": _presets.manifest()})
+
+    @app.get("/preset/{name}")
+    async def preset_asset(name: str):
+        """Serve one preset asset.
+
+        The name is resolved against the known preset keys rather than joined
+        onto a path, so a crafted name cannot walk out of the directory.
+        """
+        from server import presets as _presets
+
+        path = _presets.asset_path(name)
+        if path is None:
+            return JSONResponse({"error": "unknown preset asset"}, status_code=404)
+        media = "image/jpeg" if path.endswith(".jpg") else "audio/wav"
+        # no-cache = always revalidate (a 304 when unchanged), NOT max-age. A
+        # day-long max-age here kept serving week-old voice clips out of
+        # browser caches while the files behind the unchanging URLs were being
+        # fixed -- the "preset voice is garbled but uploading the same file
+        # works" bug. The manifest now also version-hashes these URLs, so a
+        # changed file is a new URL regardless of what any cache believes.
+        return FileResponse(path, media_type=media,
+                            headers={"Cache-Control": "no-cache"})
 
     @app.post("/voice")
     async def voice(request: Request) -> JSONResponse:
@@ -969,32 +1058,39 @@ def build_app(
 
     @app.get("/healthz")
     async def healthz() -> JSONResponse:
-        sess = state["session"]
+        with _HOLDERS_LOCK:
+            holders = list(_HOLDERS.values())
+            sessions = list(_WS_SESSIONS.values())
         return JSONResponse({
             "ok": True,
-            "lease_held": holder.loaded,
-            "lease_warm_seconds": holder.warm_seconds,
-            "lease_session_seconds": holder.session_seconds,
-            "lease_error": holder.load_error,
+            "leases_held": sum(1 for h in holders if h.loaded),
+            "lease_errors": [h.load_error for h in holders if h.load_error],
             "gpu_size": gpu_session.GPU_SIZE,
             "lease_seconds": gpu_session.LEASE_SECONDS,
-            "busy": sess is not None,
+            "slots_in_use": gpu_session.slots_in_use(),
+            "max_sessions": gpu_session.MAX_SESSIONS,
+            "busy": gpu_session.slots_in_use() >= gpu_session.MAX_SESSIONS,
             "sessions_total": state["sessions_total"],
-            "session": sess.stats() if sess is not None else None,
+            "sessions": [s.stats() for s in sessions],
         })
 
     @app.websocket("/ws")
     async def ws_endpoint(ws: WebSocket) -> None:
         await ws.accept()
 
-        # ---- single concurrent session ---- #
-        if state["session"] is not None:
+        # Which conversation is this? The token comes from the `ready` event of
+        # the /run_session job that holds this socket's lease. Without it there
+        # is no way to tell concurrent sessions apart.
+        token = ws.query_params.get("t") or ""
+        with _HOLDERS_LOCK:
+            holder = _HOLDERS.get(token)
+        if holder is None:
             await ws.send_text(json.dumps({
-                "type": "error", "code": "busy",
-                "text": "Another session is already running. Try again in a moment.",
+                "type": "error", "code": "no_lease",
+                "text": "That GPU session is not running. Start a new one.",
             }))
             with contextlib.suppress(Exception):
-                await ws.close(code=1013)  # try again later
+                await ws.close(code=1013)
             return
 
         # The client is supposed to hold a lease (via /run_session) before it
@@ -1009,22 +1105,29 @@ def build_app(
                 await ws.close(code=1011)
             return
 
+        session = _Session(ws, gpu, brain_factory)
+
         # A new user is (probably) framed differently: drop the previous session's
         # EMA face box so the first detection re-locks immediately instead of
-        # inheriting a stale crop for up to `detect_every` frames.
+        # inheriting a stale crop for up to `detect_every` frames. On the
+        # session's own crop thread, so it cannot be reordered against the
+        # frames that follow it.
         with contextlib.suppress(Exception):
             await asyncio.get_running_loop().run_in_executor(
-                _CROP_EXECUTOR, gpu.reset_cropper)
+                session._crop_exec, gpu.reset_cropper)
 
-        session = _Session(ws, gpu, brain_factory)
-        state["session"] = session
+        with _HOLDERS_LOCK:
+            _WS_SESSIONS[token] = session
         state["sessions_total"] += 1
-        log.info("session #%d started", state["sessions_total"])
+        log.info("session #%d started on slot %d (%d/%d in use)",
+                 state["sessions_total"], getattr(gpu, "slot", 0),
+                 gpu_session.slots_in_use(), gpu_session.MAX_SESSIONS)
 
         tasks: list[asyncio.Task] = []
         try:
             session.enqueue({"type": "hello", "server": "avatar", "fps": FPS,
                              "sr": SR, "block_frames": BLOCK_FRAMES,
+                             "carryover_token": session.carryover_token,
                              "system_prompt": default_system_prompt,
                              "max_prompt_chars": MAX_PROMPT_CHARS})
             tasks = [
@@ -1059,8 +1162,11 @@ def build_app(
                     with contextlib.suppress(Exception):
                         hist = session.brain.export_history()
                         if hist:
-                            _CARRYOVER["history"] = hist
-                            _CARRYOVER["at"] = time.monotonic()
+                            # Under the token this client was given in `hello`.
+                            # Minted at session START, not here: by the time we
+                            # unwind, the writer task is stopping and a message
+                            # enqueued now might never reach the client.
+                            _carryover_put(session.carryover_token, hist)
                 with contextlib.suppress(Exception):
                     await session.brain.stop()
             # No leakage: the next user gets the default face back. Only worth
@@ -1069,16 +1175,15 @@ def build_app(
             if session.ref_applied and gpu.live:
                 with contextlib.suppress(Exception):
                     await asyncio.get_running_loop().run_in_executor(
-                        _GPU_EXECUTOR, gpu.set_reference, None)
+                        session._gpu_exec, gpu.set_reference, None)
             log.info("session #%d ended: %s", state["sessions_total"], session.stats())
-            state["session"] = None
+            with _HOLDERS_LOCK:
+                _WS_SESSIONS.pop(token, None)
+            session._gpu_exec.shutdown(wait=False)
+            session._crop_exec.shutdown(wait=False)
             with contextlib.suppress(Exception):
                 await ws.close()
 
-    # NOTE: the dedicated Space preloaded the engine here (a middleware kick,
-    # because gradio's own lifespan swallows @app.on_event("startup")). On
-    # ZeroGPU there is nothing to preload: the weights are already built and
-    # packed at import in app.py, and everything else needs the lease.
-    app.state.lease_holder = holder      # handy for tests / integration
+    app.state.holders = _HOLDERS         # handy for tests / integration
     app.preload_blocking = lambda *a, **k: None  # type: ignore[attr-defined]
     return app

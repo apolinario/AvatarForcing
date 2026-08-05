@@ -5,10 +5,8 @@
 # reconciled below against what the code actually imports.
 
 # --- torch stack ----------------------------------------------------------- #
-# The ZeroGPU image already ships cu128 wheels for every torch it accepts
-# (2.8.0 / 2.9.1 / 2.10.0 / 2.11.0), so the explicit PyTorch index and the
-# +cu128 local tags the dedicated Space needed are dropped -- keeping them makes
-# pip resolve against download.pytorch.org and fight the preinstalled runtime.
+# The ZeroGPU image ships cu128 wheels for every torch it accepts; explicit
+# PyTorch indexes or +cu128 local tags make pip fight the preinstalled runtime.
 torch==2.11.0
 torchvision==0.26.0         # must match torch 2.11; models/avatarforcing uses torchvision.transforms.functional
 torchaudio==2.11.0          # required by omnivoice (must match torch)
@@ -30,10 +28,8 @@ soxr>=0.5
 av>=12.0                    # torchvision.io.write_video is gone in torchvision >= 0.26
 albumentations>=2.0.8
 pandas>=2.2
-# librosa is now pulled in by omnivoice and resolves fine: numba 0.66 supports
-# numpy 2.4, so the old "no numba release supports this numpy" note is stale.
-# inference.py still uses soundfile+soxr and does not import it.
-# matplotlib deliberately omitted: it is in AvatarForcing/requirements.txt but nothing imports it.
+# librosa is pulled in by omnivoice; inference.py itself uses soundfile+soxr.
+# matplotlib is in AvatarForcing/requirements.txt but nothing imports it.
 
 # --- server ---------------------------------------------------------------- #
 # gradio is NOT listed: it is platform-managed and pinned by README sdk_version
@@ -50,6 +46,11 @@ openai>=1.40                # AsyncOpenAI against the HF router (chat.completion
 # verified to resolve against the pins above (and gradio stays platform-managed
 # at the README's 6.20.0) on multimodalart/omnivoice-bench-zerogpu.
 omnivoice==0.2.1
+
+# --- semantic end-of-turn (server/turn_detect.py) --------------------------- #
+# CPU build on purpose: smart-turn runs in the WEB process, which has no GPU on
+# ZeroGPU, and onnxruntime-gpu there would only pull CUDA libs it can never use.
+onnxruntime>=1.20
 
 # --- cold-start weight download (app.py: ensure_weights) ------------------- #
 # checkpoints come from the Hub mirror multimodalart/AvatarForcingHelpers (the
