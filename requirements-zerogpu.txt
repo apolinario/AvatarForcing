@@ -53,6 +53,5 @@ omnivoice==0.2.1
 onnxruntime>=1.20
 
 # --- cold-start weight download (app.py: ensure_weights) ------------------- #
-# checkpoints come from the Hub mirror multimodalart/AvatarForcingHelpers (the
-# authors' Google Drive links rate-limit); gdown is no longer needed.
+# checkpoints come from the Hub mirror multimodalart/AvatarForcingHelpers.
 # huggingface_hub is NOT listed either -- preinstalled and platform-managed.
